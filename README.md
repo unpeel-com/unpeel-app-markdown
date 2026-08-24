@@ -26,7 +26,7 @@ itself is ordinary Ratatui (`tui-textarea` for the buffer).
 Install:
 
 ```sh
-curl -fsSL https://unpeel.com/markdown/install.sh | sh
+curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
 ```
 
 Ported from the `markdown-editor` experiment in `unpeel-experiments`.
