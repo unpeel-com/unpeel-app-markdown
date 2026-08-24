@@ -29,4 +29,20 @@ Install:
 curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
 ```
 
+## Development
+
+```sh
+cargo run -- demo.md   # the editor on the bundled demo document
+cargo run -- .         # vault mode on the current directory
+cargo test
+```
+
+Running any build once self-installs the App manifest into
+`~/.unpeel/apps/unpeel.app.markdown/` with that binary's absolute path as
+the launch command — so after `cargo run`, typing
+`target/debug/unpeel-markdown` (or launching its seeded preset) inside
+Unpeel shows the branded row and the "editing <file>" status line against
+your dev build. The manifest rewrites on every run, so release and debug
+builds simply take over from each other.
+
 Ported from the `markdown-editor` experiment in `unpeel-experiments`.
