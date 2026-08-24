@@ -23,4 +23,10 @@ There is no SDK: the whole integration is `src/unpeel.rs` and
 `src/install.rs`, plain files and one tiny local HTTP contract. The editor
 itself is ordinary Ratatui (`tui-textarea` for the buffer).
 
+Install:
+
+```sh
+curl -fsSL https://unpeel.com/markdown/install.sh | sh
+```
+
 Ported from the `markdown-editor` experiment in `unpeel-experiments`.
