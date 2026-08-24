@@ -2,11 +2,12 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Margin, Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::block::BlockKind;
+use crate::theme::Theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuOrigin {
@@ -289,6 +290,7 @@ pub fn render_menu(
     anchor: Position,
     items: &[&MenuItem],
     selected: usize,
+    theme: Theme,
 ) -> MenuHit {
     let rows = items.len().max(1) as u16;
     let height = rows.saturating_add(2);
@@ -304,7 +306,10 @@ pub fn render_menu(
     let mut item_rects = Vec::with_capacity(items.len());
     let mut lines = Vec::with_capacity(items.len().max(1));
     if items.is_empty() {
-        lines.push(Line::from(" no matching block".dark_gray()));
+        lines.push(Line::from(Span::styled(
+            " no matching block",
+            Style::new().fg(theme.muted),
+        )));
     } else {
         let row_width = usize::from(inner.width);
         for (i, item) in items.iter().enumerate() {
@@ -323,10 +328,13 @@ pub fn render_menu(
             if i == selected {
                 lines.push(Line::from(Span::styled(
                     text,
-                    Style::new().fg(Color::Black).bg(Color::Gray).bold(),
+                    Style::new()
+                        .fg(theme.selected_text)
+                        .bg(theme.selected)
+                        .bold(),
                 )));
             } else {
-                lines.push(Line::from(text.dark_gray()));
+                lines.push(Line::from(Span::styled(text, Style::new().fg(theme.muted))));
             }
         }
     }
@@ -334,9 +342,12 @@ pub fn render_menu(
     let widget = Paragraph::new(lines).block(
         Block::bordered()
             .title(" insert ")
-            .title_style(Style::new().bold())
-            .title_bottom(" ↑↓  ⏎ apply  esc ")
-            .border_style(Style::new().dark_gray()),
+            .title_style(Style::new().fg(theme.strong).bold())
+            .title_bottom(Line::from(Span::styled(
+                " ↑↓  ⏎ apply  esc ",
+                Style::new().fg(theme.muted),
+            )))
+            .border_style(Style::new().fg(theme.faint)),
     );
     frame.render_widget(Clear, area);
     frame.render_widget(widget, area);

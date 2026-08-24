@@ -9,6 +9,7 @@ mod install;
 mod mouse;
 mod picker;
 mod slash;
+mod theme;
 mod unpeel;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use app::App;
 use backend::BackendCapture;
 use picker::Picker;
+use theme::Theme;
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -23,23 +25,31 @@ fn main() -> color_eyre::Result<()> {
     let mut status = unpeel::StatusReporter::detect();
     status.idle();
     let path = resolve_path();
+    let theme = Theme::detect();
     ratatui::run(|terminal| {
         let _capture = BackendCapture::enable(terminal)?;
         if path.is_dir() {
-            // Vault mode: searchable note list; quitting the editor returns here.
-            let mut picker = Picker::open(path)?;
+            // Vault mode: searchable note list; quitting the editor returns
+            // here. The session title follows navigation: the open note
+            // while editing, the vault folder while browsing.
+            let vault_title = display_name(&path);
+            status.set_title(&vault_title);
+            let mut picker = Picker::open(path, theme)?;
             while let Some(file) = picker.pick(terminal)? {
+                status.set_title(&display_name(&file));
                 status.set_status(&editing_status(&file));
                 status.flush();
-                App::open(file)?.run(terminal)?;
+                App::open(file, theme)?.run(terminal)?;
+                status.set_title(&vault_title);
                 status.set_status("browsing notes");
                 status.flush();
             }
             Ok(())
         } else {
+            status.set_title(&display_name(&path));
             status.set_status(&editing_status(&path));
             status.flush();
-            App::open(path)?.run(terminal)
+            App::open(path, theme)?.run(terminal)
         }
     })?;
     Ok(())
@@ -48,11 +58,21 @@ fn main() -> color_eyre::Result<()> {
 /// Sidebar status line: which note is open. Editing is user-paced typing, so
 /// this App never claims Busy — the status text is the live surface.
 fn editing_status(path: &PathBuf) -> String {
-    let name = path
+    format!("editing {}", display_name(path))
+}
+
+/// The session-title form of a path: the file or folder name. "." resolves
+/// to the real directory name so a bare vault launch titles usefully.
+fn display_name(path: &PathBuf) -> String {
+    let resolved = if path.as_os_str() == "." {
+        std::env::current_dir().unwrap_or_else(|_| path.clone())
+    } else {
+        path.clone()
+    };
+    resolved
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    format!("editing {name}")
+        .unwrap_or_else(|| resolved.display().to_string())
 }
 
 fn resolve_path() -> PathBuf {

@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{DefaultTerminal, Frame};
@@ -20,6 +20,7 @@ use crate::heading;
 use crate::highlight;
 use crate::mouse;
 use crate::slash::{self, ItemId, MenuHit, MenuOrigin};
+use crate::theme::Theme;
 
 const EDITOR_LEFT_PADDING: u16 = 1;
 
@@ -51,6 +52,7 @@ struct DragState {
 pub struct App<'a> {
     path: PathBuf,
     textarea: TextArea<'a>,
+    theme: Theme,
     mode: Mode,
     menu: Option<BlockMenu>,
     dirty: bool,
@@ -63,20 +65,21 @@ pub struct App<'a> {
 }
 
 impl App<'_> {
-    pub fn open(path: PathBuf) -> io::Result<Self> {
+    pub fn open(path: PathBuf, theme: Theme) -> io::Result<Self> {
         let contents = if path.exists() {
             std::fs::read_to_string(&path)?
         } else {
             String::new()
         };
         let mut textarea = TextArea::from(contents.lines());
-        configure_textarea(&mut textarea);
-        highlight::refresh(&mut textarea);
+        configure_textarea(&mut textarea, theme);
+        highlight::refresh(&mut textarea, theme);
 
         let is_new = !path.exists();
         let mut app = Self {
             path,
             textarea,
+            theme,
             mode: Mode::Edit,
             menu: None,
             dirty: false,
@@ -102,16 +105,35 @@ impl App<'_> {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [main, status] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+        let [header, main, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
 
+        self.draw_header(frame, header);
         self.draw_editor(frame, main);
         self.draw_empty_hint(frame, main);
-        frame.render_widget(self.status_line(), status);
+        self.draw_footer(frame, footer);
 
         if self.mode == Mode::Menu {
             self.draw_menu(frame, main);
         }
+    }
+
+    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(self.header_line()).style(Style::new().fg(self.theme.text)),
+            area,
+        );
+    }
+
+    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(self.footer_line()).style(Style::new().fg(self.theme.text)),
+            area,
+        );
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
@@ -152,7 +174,7 @@ impl App<'_> {
             width: body.width.saturating_sub(gutter_area.width),
             height: body.height,
         };
-        highlight::refresh(&mut self.textarea);
+        highlight::refresh(&mut self.textarea, self.theme);
         frame.render_widget(&self.textarea, text_area);
         self.sync_scroll();
         self.draw_gutter(frame, gutter_area);
@@ -192,9 +214,9 @@ impl App<'_> {
                 }
                 let label = format!("{:>digits$}  ", row.line + 1);
                 if row.line == current {
-                    Line::from(label.gray())
+                    Line::from(Span::styled(label, Style::new().fg(self.theme.muted)))
                 } else {
-                    Line::from(label.dark_gray())
+                    Line::from(Span::styled(label, Style::new().fg(self.theme.faint)))
                 }
             })
             .collect();
@@ -220,9 +242,9 @@ impl App<'_> {
                 .begin_symbol(None)
                 .end_symbol(None)
                 .track_symbol(Some("│"))
-                .track_style(Style::default().fg(Color::DarkGray))
+                .track_style(Style::default().fg(self.theme.faint))
                 .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(Color::Gray)),
+                .thumb_style(Style::default().fg(self.theme.muted)),
             area,
             &mut state,
         );
@@ -245,52 +267,59 @@ impl App<'_> {
                 area.x.saturating_add(2),
                 area.y.saturating_add(1),
             ));
-        let hit = slash::render_menu(frame, area, anchor, &items, selected);
+        let hit = slash::render_menu(frame, area, anchor, &items, selected, self.theme);
         if let Some(menu) = self.menu.as_mut() {
             menu.selected = selected;
             menu.hit = Some(hit);
         }
     }
 
-    fn status_line(&self) -> Paragraph<'_> {
+    fn header_line(&self) -> Line<'_> {
         let (row, col) = self.textarea.cursor();
+        Line::from(vec![
+            " ".into(),
+            Span::styled(file_name(&self.path), Style::new().fg(self.theme.strong)),
+            if self.dirty {
+                " ●  ".into()
+            } else {
+                Span::styled(" ✓  ", Style::new().fg(self.theme.faint))
+            },
+            Span::styled(
+                format!("{}:{}", row + 1, col + 1),
+                Style::new().fg(self.theme.muted),
+            ),
+        ])
+    }
+
+    fn footer_line(&self) -> Line<'_> {
         let message = self
             .status
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
             .map(|(text, _)| text.as_str());
-        let mut spans: Vec<Span> = vec![
-            file_name(&self.path).into(),
-            if self.dirty {
-                " ●  ".into()
-            } else {
-                " ✓  ".dark_gray()
-            },
-            format!("{}:{}", row + 1, col + 1).dark_gray(),
-            "  ".into(),
-        ];
+        let mut spans: Vec<Span> = vec![" ".into()];
         if let Some(message) = message {
             spans.push(message.into());
         } else if self.mode == Mode::Menu {
             spans.extend([
                 "↑↓".bold(),
-                " select  ".dark_gray(),
+                Span::styled(" select  ", Style::new().fg(self.theme.muted)),
                 "⏎".bold(),
-                " apply  ".dark_gray(),
+                Span::styled(" apply  ", Style::new().fg(self.theme.muted)),
                 "Esc".bold(),
-                " close".dark_gray(),
+                Span::styled(" close", Style::new().fg(self.theme.muted)),
             ]);
         } else {
             spans.extend([
                 "/".bold(),
-                " insert  ".dark_gray(),
+                Span::styled(" insert  ", Style::new().fg(self.theme.muted)),
                 "^S".bold(),
-                " save  ".dark_gray(),
+                Span::styled(" save  ", Style::new().fg(self.theme.muted)),
                 "Esc".bold(),
-                " quit".dark_gray(),
+                Span::styled(" quit", Style::new().fg(self.theme.muted)),
             ]);
         }
-        Paragraph::new(Line::from(spans)).style(Style::new().fg(Color::Gray))
+        Line::from(spans)
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -716,8 +745,8 @@ impl App<'_> {
         }
         self.path = PathBuf::from("untitled.md");
         self.textarea = TextArea::from([""]);
-        configure_textarea(&mut self.textarea);
-        highlight::refresh(&mut self.textarea);
+        configure_textarea(&mut self.textarea, self.theme);
+        highlight::refresh(&mut self.textarea, self.theme);
         self.dirty = false;
         self.flash("new file");
     }
@@ -1121,14 +1150,14 @@ impl App<'_> {
             return;
         }
         frame.render_widget(
-            Paragraph::new(hint).dark_gray().dim(),
+            Paragraph::new(hint).style(Style::new().fg(self.theme.faint)),
             Rect::new(position.x, position.y, width, 1),
         );
     }
 
     fn after_edit(&mut self) {
         self.dirty = true;
-        highlight::refresh(&mut self.textarea);
+        highlight::refresh(&mut self.textarea, self.theme);
     }
 
     fn save(&mut self) {
@@ -1172,13 +1201,13 @@ fn input_from_key(key: KeyEvent) -> Input {
     input
 }
 
-fn configure_textarea(textarea: &mut TextArea<'_>) {
+fn configure_textarea(textarea: &mut TextArea<'_>, theme: Theme) {
     textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
     textarea.set_wrap_mode(tui_textarea::WrapMode::WordOrGlyph);
     textarea.set_tab_length(2);
     textarea.remove_line_number();
-    textarea.set_cursor_line_style(Style::new().bg(Color::Rgb(28, 28, 28)));
-    textarea.set_cursor_style(Style::new().bg(Color::Gray).fg(Color::Black));
+    textarea.set_cursor_line_style(Style::new().bg(theme.cursor_line));
+    textarea.set_cursor_style(Style::new().bg(theme.cursor).fg(theme.cursor_text));
     // Built-in selection is unstyled; rainbow paint lives in highlight::refresh.
     textarea.set_selection_style(Style::new());
     textarea.set_placeholder_text("Type '/' for commands");
@@ -1210,6 +1239,23 @@ fn file_name(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn render_app(theme: Theme, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.md");
+        let mut app = App::open(path, theme).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
     #[test]
     fn scrollbar_length_is_scroll_positions() {
         assert_eq!(scrollbar_content_length(10, 10), None);
@@ -1223,5 +1269,35 @@ mod tests {
         assert_eq!(max_scroll_offset(10, 10), 0);
         assert_eq!(max_scroll_offset(10, 20), 0);
         assert_eq!(max_scroll_offset(15, 10), 5);
+    }
+
+    #[test]
+    fn header_places_document_top_left_and_shortcuts_bottom_left() {
+        let width = 80;
+        let buffer = render_app(Theme::dark(), width, 8);
+        let header = row_text(&buffer, 0);
+        let footer = row_text(&buffer, 7);
+        let shortcuts = "/ insert  ^S save  Esc quit";
+
+        assert!(header.starts_with(" demo.md ✓  1:1"));
+        assert!(!header.contains(shortcuts));
+        assert!(footer.starts_with(&format!(" {shortcuts}")));
+        assert!(!footer.contains("demo.md"));
+    }
+
+    #[test]
+    fn light_and_dark_renders_use_their_contrast_palettes() {
+        for theme in [Theme::light(), Theme::dark()] {
+            let buffer = render_app(theme, 80, 8);
+            assert_eq!(buffer[(1, 0)].fg, theme.strong, "document title color");
+            let heading_x = (0..buffer.area.width)
+                .find(|&x| buffer[(x, 1)].symbol() == "#")
+                .expect("first editor row contains a heading");
+            assert_eq!(buffer[(heading_x, 1)].fg, theme.strong, "heading color");
+            let body_x = (0..buffer.area.width)
+                .find(|&x| buffer[(x, 3)].symbol() == "O")
+                .expect("third editor row contains body copy");
+            assert_eq!(buffer[(body_x, 3)].fg, theme.text, "body color");
+        }
     }
 }

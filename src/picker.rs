@@ -12,10 +12,12 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+
+use crate::theme::Theme;
 
 struct Entry {
     rel: String,
@@ -33,10 +35,11 @@ pub struct Picker {
     selected: usize,
     offset: usize,
     list_area: Rect,
+    theme: Theme,
 }
 
 impl Picker {
-    pub fn open(root: PathBuf) -> io::Result<Self> {
+    pub fn open(root: PathBuf, theme: Theme) -> io::Result<Self> {
         let name = root
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -50,6 +53,7 @@ impl Picker {
             selected: 0,
             offset: 0,
             list_area: Rect::default(),
+            theme,
         };
         picker.rescan()?;
         Ok(picker)
@@ -189,7 +193,9 @@ impl Picker {
         let [main, status] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
         let title = format!(" {} — {} notes ", self.name, self.entries.len());
-        let block = Block::bordered().title(title.dark_gray()).dark_gray();
+        let block = Block::bordered()
+            .title(Span::styled(title, Style::new().fg(self.theme.muted)))
+            .border_style(Style::new().fg(self.theme.faint));
         let inner = block.inner(main).inner(Margin {
             horizontal: 1,
             vertical: 0,
@@ -205,8 +211,8 @@ impl Picker {
         self.list_area = list;
 
         let prompt = Line::from(vec![
-            Span::styled("search ", Style::new().dark_gray()),
-            Span::styled(&self.query, Style::new().bold()),
+            Span::styled("search ", Style::new().fg(self.theme.muted)),
+            Span::styled(&self.query, Style::new().fg(self.theme.strong).bold()),
         ]);
         frame.render_widget(Paragraph::new(prompt), search);
         frame.set_cursor_position(Position {
@@ -214,7 +220,10 @@ impl Picker {
             y: search.y,
         });
         frame.render_widget(
-            Paragraph::new("─".repeat(divider.width as usize).dark_gray()),
+            Paragraph::new(Span::styled(
+                "─".repeat(divider.width as usize),
+                Style::new().fg(self.theme.faint),
+            )),
             divider,
         );
 
@@ -231,7 +240,10 @@ impl Picker {
             } else {
                 "no matches"
             };
-            frame.render_widget(Paragraph::new(message.dark_gray().italic()), list);
+            frame.render_widget(
+                Paragraph::new(message).style(Style::new().fg(self.theme.muted).italic()),
+                list,
+            );
         }
         for (row, &(entry, ref positions)) in self
             .matches
@@ -255,7 +267,7 @@ impl Picker {
         let hints = Line::from(vec![
             Span::styled(
                 " type to search · ↑↓ move · enter open · esc ",
-                Style::new().dark_gray(),
+                Style::new().fg(self.theme.muted),
             ),
             Span::styled(
                 if self.query.is_empty() {
@@ -263,7 +275,7 @@ impl Picker {
                 } else {
                     "clear"
                 },
-                Style::new().dark_gray(),
+                Style::new().fg(self.theme.muted),
             ),
         ]);
         frame.render_widget(Paragraph::new(hints), status);
@@ -272,19 +284,19 @@ impl Picker {
     fn row_line(&self, entry: &Entry, positions: &[usize], selected: bool) -> Line<'static> {
         let mut spans = vec![Span::styled(
             if selected { "› " } else { "  " },
-            Style::new().yellow().bold(),
+            Style::new().fg(self.theme.accent).bold(),
         )];
         let name_start = entry.rel.rfind('/').map_or(0, |i| i + 1);
         for (i, (byte, c)) in entry.rel.char_indices().enumerate() {
             let mut style = if byte < name_start {
-                Style::new().dark_gray()
+                Style::new().fg(self.theme.faint)
             } else if selected {
-                Style::new().bold()
+                Style::new().fg(self.theme.strong).bold()
             } else {
-                Style::new()
+                Style::new().fg(self.theme.text)
             };
             if positions.contains(&i) {
-                style = style.yellow().bold();
+                style = style.fg(self.theme.accent).bold();
             }
             spans.push(Span::styled(c.to_string(), style));
         }
@@ -382,6 +394,52 @@ mod tests {
     }
 
     #[test]
+    fn typing_filters_the_picker_and_escape_clears_the_query() {
+        let mut picker = Picker {
+            root: PathBuf::from("."),
+            name: "notes".into(),
+            entries: vec![
+                Entry {
+                    rel: "README.md".into(),
+                    path: PathBuf::from("README.md"),
+                    modified: SystemTime::UNIX_EPOCH,
+                },
+                Entry {
+                    rel: "demo.md".into(),
+                    path: PathBuf::from("demo.md"),
+                    modified: SystemTime::UNIX_EPOCH,
+                },
+            ],
+            matches: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            offset: 0,
+            list_area: Rect::default(),
+            theme: Theme::dark(),
+        };
+        picker.refilter();
+
+        for ch in "demo".chars() {
+            assert!(
+                picker
+                    .on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                    .is_none()
+            );
+        }
+        assert_eq!(picker.query, "demo");
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(picker.entries[picker.matches[0].0].rel, "demo.md");
+
+        assert!(
+            picker
+                .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(picker.query.is_empty());
+        assert_eq!(picker.matches.len(), 2);
+    }
+
+    #[test]
     fn renders_workspace_vault_list() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -390,7 +448,7 @@ mod tests {
         if !root.exists() {
             return; // workspace test vault not present; nothing to render
         }
-        let mut picker = Picker::open(root).unwrap();
+        let mut picker = Picker::open(root, Theme::dark()).unwrap();
         picker.query = "2026".into();
         picker.refilter();
 

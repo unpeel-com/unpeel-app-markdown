@@ -37,6 +37,9 @@ cargo run -- .         # vault mode on the current directory
 cargo test
 ```
 
+The editor follows the terminal's light or dark palette at startup. Set
+`UNPEEL_THEME=light` or `UNPEEL_THEME=dark` to override detection.
+
 Running any build once self-installs the App manifest into
 `~/.unpeel/apps/unpeel.app.markdown/` with that binary's absolute path as
 the launch command — so after `cargo run`, typing

@@ -136,6 +136,34 @@ impl StatusReporter {
         }
     }
 
+    /// Report what this App is currently showing ("hero.md", a picked note,
+    /// a project folder). Unpeel folds it into the session's title the way
+    /// agent auto-titles work: it keeps following later calls (picker →
+    /// another document retitles), and a user's manual rename permanently
+    /// wins. Not debounced — call it on real navigation, not per keystroke.
+    pub fn set_title(&self, text: &str) {
+        let Some(host) = &self.host else { return };
+        if !host.session_dir.is_dir() {
+            return;
+        }
+        let text = text.trim().replace(['\n', '\r'], " ");
+        if text.is_empty() {
+            return;
+        }
+        let body = format!(
+            r#"{{"text":{},"updated_at":{}}}"#,
+            json_string(&text),
+            now_ms()
+        );
+        let tmp = host.session_dir.join(".app-title.json.tmp");
+        let ok = std::fs::write(&tmp, body)
+            .and_then(|_| std::fs::rename(&tmp, host.session_dir.join("app-title.json")))
+            .is_ok();
+        if ok {
+            post_json(host, "/state-changed", r#"{"change":"session-markers"}"#);
+        }
+    }
+
     fn write_status(&mut self, text: &str) {
         let Some(host) = &self.host else { return };
         // Never create the session dir — the session may already be gone.

@@ -4,12 +4,13 @@ use ratatui::style::{Color, Modifier, Style};
 use tui_textarea::TextArea;
 
 use crate::block::{self, BlockKind};
+use crate::theme::Theme;
 
-pub fn refresh(textarea: &mut TextArea<'_>) {
+pub fn refresh(textarea: &mut TextArea<'_>, theme: Theme) {
     textarea.clear_custom_highlight();
     let lines: Vec<String> = textarea.lines().to_vec();
     let selection = textarea.selection_range();
-    for (range, style, priority) in collect(&lines) {
+    for (range, style, priority) in collect(&lines, theme) {
         // tui-textarea treats custom_highlight columns as UTF-8 byte offsets and
         // slices the line with them. Cursor/selection columns are character indexes.
         // A later custom span replaces the previous style entirely, so markdown
@@ -194,7 +195,7 @@ fn exclude_selection(range: Range, selection: Option<Range>) -> Vec<Range> {
     parts
 }
 
-fn collect(lines: &[String]) -> Vec<(Range, Style, u8)> {
+fn collect(lines: &[String], theme: Theme) -> Vec<(Range, Style, u8)> {
     let mut out = Vec::new();
     let mut in_fence = false;
 
@@ -202,31 +203,66 @@ fn collect(lines: &[String]) -> Vec<(Range, Style, u8)> {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             in_fence = !in_fence;
-            push_span(&mut out, row, 0, line.chars().count(), fence_style(), 20);
+            push_span(
+                &mut out,
+                row,
+                0,
+                line.chars().count(),
+                fence_style(theme),
+                20,
+            );
             continue;
         }
         if in_fence {
-            push_span(&mut out, row, 0, line.chars().count(), code_style(), 20);
+            push_span(
+                &mut out,
+                row,
+                0,
+                line.chars().count(),
+                code_style(theme),
+                20,
+            );
             continue;
         }
 
         let parsed = block::parse(line);
         match parsed.kind {
             BlockKind::Heading(_) => {
-                push_span(&mut out, row, 0, line.chars().count(), heading_style(), 10);
+                push_span(
+                    &mut out,
+                    row,
+                    0,
+                    line.chars().count(),
+                    heading_style(theme),
+                    10,
+                );
             }
             BlockKind::Divider => {
-                push_span(&mut out, row, 0, line.chars().count(), divider_style(), 10);
+                push_span(
+                    &mut out,
+                    row,
+                    0,
+                    line.chars().count(),
+                    divider_style(theme),
+                    10,
+                );
             }
             BlockKind::Todo => {
-                push_span(&mut out, row, 0, line.chars().count(), paragraph_style(), 1);
+                push_span(
+                    &mut out,
+                    row,
+                    0,
+                    line.chars().count(),
+                    paragraph_style(theme),
+                    1,
+                );
                 if let Some((start, end_inclusive)) = block::checkbox_cols(line) {
                     push_span(
                         &mut out,
                         row,
                         start,
                         end_inclusive + 1,
-                        checkbox_style(),
+                        checkbox_style(theme),
                         12,
                     );
                 }
@@ -236,24 +272,31 @@ fn collect(lines: &[String]) -> Vec<(Range, Style, u8)> {
                         row,
                         parsed.prefix_cols,
                         line.chars().count(),
-                        done_style(),
+                        done_style(theme),
                         11,
                     );
                 }
             }
             _ if !line.is_empty() => {
-                push_span(&mut out, row, 0, line.chars().count(), paragraph_style(), 1);
+                push_span(
+                    &mut out,
+                    row,
+                    0,
+                    line.chars().count(),
+                    paragraph_style(theme),
+                    1,
+                );
             }
             _ => {}
         }
 
-        highlight_inlines(row, line, &mut out);
+        highlight_inlines(row, line, &mut out, theme);
     }
 
     out
 }
 
-fn highlight_inlines(row: usize, line: &str, out: &mut Vec<(Range, Style, u8)>) {
+fn highlight_inlines(row: usize, line: &str, out: &mut Vec<(Range, Style, u8)>, theme: Theme) {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -261,7 +304,7 @@ fn highlight_inlines(row: usize, line: &str, out: &mut Vec<(Range, Style, u8)>) 
             && let Some(rel) = chars[i + 1..].iter().position(|&c| c == '`')
         {
             let end = i + 1 + rel;
-            push_span(out, row, i, end + 1, code_style(), 30);
+            push_span(out, row, i, end + 1, code_style(theme), 30);
             i = end + 1;
             continue;
         }
@@ -270,7 +313,7 @@ fn highlight_inlines(row: usize, line: &str, out: &mut Vec<(Range, Style, u8)>) 
             && let Some(rel) = find_closing(&chars, i + 2, &['*', '*'])
         {
             let end = i + 2 + rel + 2;
-            push_span(out, row, i, end, bold_style(), 15);
+            push_span(out, row, i, end, bold_style(theme), 15);
             i = end;
             continue;
         }
@@ -279,7 +322,7 @@ fn highlight_inlines(row: usize, line: &str, out: &mut Vec<(Range, Style, u8)>) 
         {
             let end = i + 1 + rel;
             if end > i + 1 {
-                push_span(out, row, i, end + 1, italic_style(), 12);
+                push_span(out, row, i, end + 1, italic_style(theme), 12);
                 i = end + 1;
                 continue;
             }
@@ -310,48 +353,50 @@ fn push_span(
     }
 }
 
-fn heading_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn paragraph_style() -> Style {
-    Style::default().fg(Color::Gray)
-}
-
-fn code_style() -> Style {
+fn heading_style(theme: Theme) -> Style {
     Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+        .fg(theme.strong)
+        .add_modifier(Modifier::BOLD)
 }
 
-fn fence_style() -> Style {
+fn paragraph_style(theme: Theme) -> Style {
+    Style::default().fg(theme.text)
+}
+
+fn code_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted)
+}
+
+fn fence_style(theme: Theme) -> Style {
+    Style::default().fg(theme.faint)
+}
+
+fn bold_style(theme: Theme) -> Style {
     Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+        .fg(theme.strong)
+        .add_modifier(Modifier::BOLD)
 }
 
-fn bold_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn italic_style() -> Style {
-    Style::default().add_modifier(Modifier::ITALIC)
-}
-
-fn divider_style() -> Style {
+fn italic_style(theme: Theme) -> Style {
     Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM)
+        .fg(theme.text)
+        .add_modifier(Modifier::ITALIC)
 }
 
-fn checkbox_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
+fn divider_style(theme: Theme) -> Style {
+    Style::default().fg(theme.faint)
 }
 
-fn done_style() -> Style {
+fn checkbox_style(theme: Theme) -> Style {
     Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT)
+        .fg(theme.strong)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn done_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.faint)
+        .add_modifier(Modifier::CROSSED_OUT)
 }
 
 #[cfg(test)]
@@ -360,7 +405,7 @@ mod tests {
 
     #[test]
     fn highlights_heading_and_inline_code() {
-        let marks = collect(&["# Title".into(), "use `code` here".into()]);
+        let marks = collect(&["# Title".into(), "use `code` here".into()], Theme::dark());
         assert!(marks.iter().any(|(range, _, _)| *range == ((0, 0), (0, 7))));
         assert!(
             marks
@@ -372,18 +417,20 @@ mod tests {
     #[test]
     fn checkbox_highlight_includes_the_closing_bracket() {
         for line in ["- [ ] open", "- [x] done"] {
-            let marks = collect(&[line.into()]);
+            let theme = Theme::dark();
+            let marks = collect(&[line.into()], theme);
             assert!(marks.iter().any(|(range, style, priority)| {
-                *range == ((0, 2), (0, 5)) && *style == checkbox_style() && *priority == 12
+                *range == ((0, 2), (0, 5)) && *style == checkbox_style(theme) && *priority == 12
             }));
         }
     }
 
     #[test]
     fn checked_todo_highlight_includes_the_first_body_character() {
-        let marks = collect(&["- [x] done".into()]);
+        let theme = Theme::dark();
+        let marks = collect(&["- [x] done".into()], theme);
         assert!(marks.iter().any(|(range, style, priority)| {
-            *range == ((0, 6), (0, 10)) && *style == done_style() && *priority == 11
+            *range == ((0, 6), (0, 10)) && *style == done_style(theme) && *priority == 11
         }));
     }
 
@@ -428,7 +475,7 @@ mod tests {
         let cmd = CMD_LINE.find('⌘').expect("demo line has ⌘");
         assert!(!CMD_LINE.is_char_boundary(cmd + 1));
 
-        for (range, _, _) in collect(&lines) {
+        for (range, _, _) in collect(&lines, Theme::dark()) {
             let ((sr, sb), (er, eb)) = range_to_bytes(&lines, range);
             assert!(lines[sr].is_char_boundary(sb), "start {sb} in {range:?}");
             assert!(lines[er].is_char_boundary(eb), "end {eb} in {range:?}");
@@ -450,7 +497,7 @@ mod tests {
         use tui_textarea::CursorMove;
 
         let mut textarea = TextArea::from([CMD_LINE]);
-        refresh(&mut textarea);
+        refresh(&mut textarea, Theme::dark());
         let area = Rect::new(0, 0, 80, 3);
         let mut buf = Buffer::empty(area);
         Widget::render(&textarea, area, &mut buf);
@@ -458,7 +505,7 @@ mod tests {
         textarea.move_cursor(CursorMove::Head);
         textarea.start_selection();
         textarea.move_cursor(CursorMove::End);
-        refresh(&mut textarea);
+        refresh(&mut textarea, Theme::dark());
         let mut buf = Buffer::empty(area);
         Widget::render(&textarea, area, &mut buf);
     }
