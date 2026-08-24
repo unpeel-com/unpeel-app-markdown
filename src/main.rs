@@ -9,6 +9,7 @@ mod install;
 mod mouse;
 mod picker;
 mod slash;
+mod start;
 mod theme;
 mod unpeel;
 
@@ -24,10 +25,23 @@ fn main() -> color_eyre::Result<()> {
     install::ensure_installed();
     let mut status = unpeel::StatusReporter::detect();
     status.idle();
-    let path = resolve_path();
+    let explicit_path = std::env::args().nth(1).map(PathBuf::from);
     let theme = Theme::detect();
     ratatui::run(|terminal| {
         let _capture = BackendCapture::enable(terminal)?;
+        let path = match explicit_path.clone() {
+            Some(path) => path,
+            None => match start::read_workspace(install::APP_ID) {
+                Some(path) => path,
+                None => {
+                    let Some(path) = start::choose_workspace(terminal, theme)? else {
+                        return Ok(());
+                    };
+                    start::write_workspace(install::APP_ID, &path)?;
+                    path
+                }
+            },
+        };
         if path.is_dir() {
             // Vault mode: searchable note list; quitting the editor returns
             // here. The session title follows navigation: the open note
@@ -75,40 +89,12 @@ fn display_name(path: &PathBuf) -> String {
         .unwrap_or_else(|| resolved.display().to_string())
 }
 
-fn resolve_path() -> PathBuf {
-    if let Some(arg) = std::env::args().nth(1) {
-        return PathBuf::from(arg);
-    }
-    // No argument: open the current directory as a vault when it holds any
-    // markdown, otherwise fall back to the bundled demo (development runs).
-    let cwd = PathBuf::from(".");
-    let has_markdown = std::fs::read_dir(&cwd).is_ok_and(|entries| {
-        entries.filter_map(|entry| entry.ok()).any(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "md")
-        })
-    });
-    if has_markdown {
-        return cwd;
-    }
-    let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.md");
-    if bundled.exists() {
-        return bundled;
-    }
-    cwd
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_path_exists() {
-        // Either the working directory as a vault or the bundled demo —
-        // both must exist so a bare launch always opens something.
-        let path = resolve_path();
-        assert!(path.exists(), "expected a default document or vault");
+    fn display_name_resolves_dot_for_explicit_vault_launches() {
+        assert!(!display_name(&PathBuf::from(".")).is_empty());
     }
 }

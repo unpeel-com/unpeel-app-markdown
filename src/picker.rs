@@ -1,9 +1,9 @@
 //! Vault picker: when the editor is pointed at a folder instead of a file,
-//! this screen lists every markdown file in it with a fuzzy search on top.
-//! Enter opens the note; quitting the editor returns here.
+//! this screen lists every Markdown file with fuzzy search plus an explicit
+//! New note row. Enter opens or creates; quitting the editor returns here.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -67,13 +67,41 @@ impl Picker {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(choice) = self.on_key(key) {
-                        return Ok(choice.into_option());
+                        match choice {
+                            Choice::Open(path) => return Ok(Some(path)),
+                            Choice::Create => {
+                                if let Some(path) =
+                                    prompt_new_note(terminal, &self.root, self.theme)?
+                                {
+                                    return Ok(Some(path));
+                                }
+                                self.rescan()?;
+                            }
+                            Choice::Quit => return Ok(None),
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {
                     if let Some(choice) = self.on_mouse(mouse) {
-                        return Ok(choice.into_option());
+                        match choice {
+                            Choice::Open(path) => return Ok(Some(path)),
+                            Choice::Create => {
+                                if let Some(path) =
+                                    prompt_new_note(terminal, &self.root, self.theme)?
+                                {
+                                    return Ok(Some(path));
+                                }
+                                self.rescan()?;
+                            }
+                            Choice::Quit => return Ok(None),
+                        }
                     }
+                }
+                Event::Paste(text) => {
+                    self.query.push_str(text.trim());
+                    self.selected = 0;
+                    self.offset = 0;
+                    self.refilter();
                 }
                 _ => {}
             }
@@ -112,8 +140,23 @@ impl Picker {
             });
         }
         self.matches = scored.into_iter().map(|(i, _, p)| (i, p)).collect();
-        self.selected = self.selected.min(self.matches.len().saturating_sub(1));
+        self.selected = self.selected.min(self.item_count().saturating_sub(1));
         self.offset = self.offset.min(self.selected);
+    }
+
+    fn show_create(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    fn item_count(&self) -> usize {
+        self.matches.len() + usize::from(self.show_create())
+    }
+
+    fn choice_at(&self, row: usize) -> Option<Choice> {
+        if let Some(&(entry, _)) = self.matches.get(row) {
+            return Some(Choice::Open(self.entries[entry].path.clone()));
+        }
+        (self.show_create() && row == self.matches.len()).then_some(Choice::Create)
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<Choice> {
@@ -126,9 +169,12 @@ impl Picker {
                 self.refilter();
             }
             KeyCode::Enter => {
-                if let Some(&(entry, _)) = self.matches.get(self.selected) {
-                    return Some(Choice::Open(self.entries[entry].path.clone()));
+                if let Some(choice) = self.choice_at(self.selected) {
+                    return Some(choice);
                 }
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Choice::Create);
             }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
@@ -166,9 +212,9 @@ impl Picker {
                     y: mouse.row,
                 }) {
                     let row = self.offset + (mouse.row - area.y) as usize;
-                    if let Some(&(entry, _)) = self.matches.get(row) {
+                    if let Some(choice) = self.choice_at(row) {
                         self.selected = row;
-                        return Some(Choice::Open(self.entries[entry].path.clone()));
+                        return Some(choice);
                     }
                 }
             }
@@ -178,10 +224,9 @@ impl Picker {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.matches.is_empty() {
+        let Some(last) = self.item_count().checked_sub(1) else {
             return;
-        }
-        let last = self.matches.len() - 1;
+        };
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
@@ -234,39 +279,46 @@ impl Picker {
             self.offset = self.selected + 1 - height;
         }
 
-        if self.matches.is_empty() {
-            let message = if self.entries.is_empty() {
-                "no markdown files in this folder"
-            } else {
-                "no matches"
-            };
+        if self.matches.is_empty() && !self.show_create() {
             frame.render_widget(
-                Paragraph::new(message).style(Style::new().fg(self.theme.muted).italic()),
+                Paragraph::new("no matches").style(Style::new().fg(self.theme.muted).italic()),
                 list,
             );
         }
-        for (row, &(entry, ref positions)) in self
-            .matches
-            .iter()
-            .enumerate()
-            .skip(self.offset)
-            .take(height)
-        {
+        for row in self.offset..self.item_count().min(self.offset + height) {
             let area = Rect {
                 y: list.y + (row - self.offset) as u16,
                 height: 1,
                 ..list
             };
             let is_selected = row == self.selected;
-            frame.render_widget(
-                self.row_line(&self.entries[entry], positions, is_selected),
-                area,
-            );
+            if let Some(&(entry, ref positions)) = self.matches.get(row) {
+                frame.render_widget(
+                    self.row_line(&self.entries[entry], positions, is_selected),
+                    area,
+                );
+            } else {
+                let marker = if is_selected { "› " } else { "  " };
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(marker, Style::new().fg(self.theme.accent).bold()),
+                        Span::styled(
+                            "+ New note",
+                            if is_selected {
+                                Style::new().fg(self.theme.strong).bold()
+                            } else {
+                                Style::new().fg(self.theme.text)
+                            },
+                        ),
+                    ])),
+                    area,
+                );
+            }
         }
 
         let hints = Line::from(vec![
             Span::styled(
-                " type to search · ↑↓ move · enter open · esc ",
+                " type to search · Ctrl+N new · ↑↓ move · enter open · esc ",
                 Style::new().fg(self.theme.muted),
             ),
             Span::styled(
@@ -306,14 +358,171 @@ impl Picker {
 
 enum Choice {
     Open(PathBuf),
+    Create,
     Quit,
 }
 
-impl Choice {
-    fn into_option(self) -> Option<PathBuf> {
-        match self {
-            Choice::Open(path) => Some(path),
-            Choice::Quit => None,
+fn note_stem(name: &str) -> Result<String, String> {
+    let name = name.trim().trim_end_matches(".md").trim();
+    if name.is_empty() {
+        return Err("enter a note name".to_string());
+    }
+    let mut stem = String::new();
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            stem.push(character);
+        } else if (character.is_whitespace() || matches!(character, '-' | '_'))
+            && !stem.is_empty()
+            && !stem.ends_with('-')
+        {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_end_matches('-').to_string();
+    if stem.is_empty() {
+        Err("use at least one letter or number".to_string())
+    } else {
+        Ok(stem)
+    }
+}
+
+fn create_note(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let title = name.trim().trim_end_matches(".md").trim();
+    let path = root.join(format!("{}.md", note_stem(name)?));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                "a note with that name already exists".to_string()
+            } else {
+                error.to_string()
+            }
+        })?;
+    if let Err(error) = writeln!(file, "# {title}\n") {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error.to_string());
+    }
+    Ok(path)
+}
+
+fn prompt_new_note(
+    terminal: &mut DefaultTerminal,
+    root: &Path,
+    theme: Theme,
+) -> io::Result<Option<PathBuf>> {
+    let mut name = String::new();
+    let mut error: Option<String> = None;
+    loop {
+        terminal.draw(|frame| {
+            let width = frame.area().width.saturating_sub(4).clamp(20, 62);
+            let height = 9.min(frame.area().height);
+            let area = Rect::new(
+                frame.area().width.saturating_sub(width) / 2,
+                frame.area().height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
+            let block = Block::bordered()
+                .title(Span::styled(
+                    " New note ",
+                    Style::new().fg(theme.accent).bold(),
+                ))
+                .border_style(Style::new().fg(theme.faint));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let [description, spacer, input, target, error_row, _, help] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            frame.render_widget(
+                Paragraph::new("Name the note you want to create.")
+                    .style(Style::new().fg(theme.muted)),
+                description,
+            );
+            let prefix = "Name  ";
+            let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
+            let chars: Vec<char> = name.chars().collect();
+            let from = chars.len().saturating_sub(available);
+            let shown: String = chars[from..].iter().collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(prefix, Style::new().fg(theme.muted)),
+                    Span::styled(shown.clone(), Style::new().fg(theme.strong)),
+                ])),
+                input,
+            );
+            frame.set_cursor_position(Position {
+                x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
+                y: input.y,
+            });
+            let target_name = note_stem(&name)
+                .map(|stem| format!("Creates {stem}.md"))
+                .unwrap_or_else(|_| "Creates a Markdown file in this folder".to_string());
+            frame.render_widget(
+                Paragraph::new(target_name).style(Style::new().fg(theme.faint)),
+                target,
+            );
+            if let Some(message) = error.as_deref() {
+                frame.render_widget(
+                    Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
+                    error_row,
+                );
+            }
+            frame.render_widget(
+                Paragraph::new("Enter create · Ctrl+U clear · Esc back")
+                    .style(Style::new().fg(theme.muted)),
+                help,
+            );
+            let _ = spacer;
+        })?;
+
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Enter => match create_note(root, &name) {
+                        Ok(path) => return Ok(Some(path)),
+                        Err(message) => error = Some(message),
+                    },
+                    KeyCode::Backspace => {
+                        name.pop();
+                        error = None;
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        name.clear();
+                        error = None;
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                            && name.chars().count() < 120 =>
+                    {
+                        name.push(character);
+                        error = None;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                let pasted: String = text
+                    .chars()
+                    .filter(|character| !matches!(character, '\n' | '\r' | '\0'))
+                    .take(120usize.saturating_sub(name.chars().count()))
+                    .collect();
+                name.push_str(&pasted);
+                error = None;
+            }
+            _ => {}
         }
     }
 }
@@ -391,6 +600,28 @@ mod tests {
     #[test]
     fn empty_query_matches_everything() {
         assert_eq!(fuzzy_match("anything.md", ""), Some((0, Vec::new())));
+    }
+
+    #[test]
+    fn new_notes_are_named_safely_and_never_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = create_note(root.path(), "Project Brief").expect("create note");
+        assert_eq!(path, root.path().join("project-brief.md"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Project Brief\n\n"
+        );
+        assert!(create_note(root.path(), "Project Brief.md").is_err());
+        assert_eq!(note_stem("../../Secrets"), Ok("secrets".to_string()));
+        assert!(note_stem("---").is_err());
+    }
+
+    #[test]
+    fn an_empty_vault_selects_new_note_instead_of_a_default_document() {
+        let root = tempfile::tempdir().unwrap();
+        let picker = Picker::open(root.path().to_path_buf(), Theme::dark()).unwrap();
+        assert_eq!(picker.item_count(), 1);
+        assert!(matches!(picker.choice_at(0), Some(Choice::Create)));
     }
 
     #[test]
