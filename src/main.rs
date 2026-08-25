@@ -48,14 +48,17 @@ fn main() -> color_eyre::Result<()> {
             // while editing, the vault folder while browsing.
             let vault_title = display_name(&path);
             status.set_title(&vault_title);
-            let mut picker = Picker::open(path, theme)?;
+            status.set_context(install::APP_ID, &browsing_context(&path));
+            status.flush();
+            let mut picker = Picker::open(path.clone(), theme)?;
             while let Some(file) = picker.pick(terminal)? {
                 status.set_title(&display_name(&file));
                 status.set_status(&editing_status(&file));
                 status.flush();
-                App::open(file, theme)?.run(terminal)?;
+                App::open(file, theme)?.run(terminal, &mut status)?;
                 status.set_title(&vault_title);
                 status.set_status("browsing notes");
+                status.set_context(install::APP_ID, &browsing_context(&path));
                 status.flush();
             }
             Ok(())
@@ -63,7 +66,7 @@ fn main() -> color_eyre::Result<()> {
             status.set_title(&display_name(&path));
             status.set_status(&editing_status(&path));
             status.flush();
-            App::open(path, theme)?.run(terminal)
+            App::open(path, theme)?.run(terminal, &mut status)
         }
     })?;
     Ok(())
@@ -73,6 +76,16 @@ fn main() -> color_eyre::Result<()> {
 /// this App never claims Busy — the status text is the live surface.
 fn editing_status(path: &PathBuf) -> String {
     format!("editing {}", display_name(path))
+}
+
+/// Agent-facing context while the user browses the vault: the folder, with
+/// no open file. Editing context comes from the editor loop itself.
+fn browsing_context(vault: &PathBuf) -> serde_json::Value {
+    let folder = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.clone());
+    serde_json::json!({
+        "file": null,
+        "folder": folder.display().to_string(),
+    })
 }
 
 /// The session-title form of a path: the file or folder name. "." resolves

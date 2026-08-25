@@ -27,7 +27,48 @@ tint = "#3B82F6"
 [views]
 terminal = true
 media_types = ["text/markdown"]
+
+[agent]
+skill = "skill.md"
 "##;
+
+const SKILL_MD: &str = r#"# Markdown — agent skill
+
+Markdown (`unpeel-markdown <file|folder>`) is a terminal markdown editor.
+Notes are plain markdown files on disk — edit them with your ordinary file
+tools; there is no hidden state or build step.
+
+## Live context
+
+Inside Unpeel the editor publishes what the user is looking at on its pane.
+Call the unified `unpeel` MCP's `sessions` tool with `{"action":"current"}`
+(or `apps` `{"action":"context"}`) — a neighboring Markdown pane's entry
+carries `app_context`:
+
+    {"app": "unpeel.app.markdown",
+     "context": {"file": "/abs/note.md",
+                 "folder": "/abs/vault",
+                 "cursor_line": 12,
+                 "selection_lines": [4, 9],
+                 "dirty": false},
+     "updated_at": <unix ms>}
+
+`file` is the note open in the editor (`null` while the user is browsing a
+notes folder — `folder` is set instead, and the cursor fields are absent).
+`cursor_line` and `selection_lines` are 1-based; `selection_lines` is
+`null` when nothing is selected. When the user says "this line", "the
+selected part", or "here", read that span from the file.
+
+## Editing rules
+
+- The editor does NOT watch for external changes. While `dirty` is true
+  the user has unsaved edits and their next save would overwrite yours —
+  do not edit the open file then; work on other notes or ask the user to
+  save first.
+- Even when clean, an edit to the open file appears only after the user
+  reopens the note — tell them to reopen it when you change it.
+- Keep edits minimal and local; it is the user's document.
+"#;
 
 fn unpeel_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("UNPEEL_HOME") {
@@ -68,14 +109,16 @@ pub fn ensure_installed() {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("app.toml");
-    // Rewrite only on change so repeated launches do not churn watchers.
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(manifest.as_str()) {
-        return;
-    }
-    let temporary = dir.join(format!(".app.toml.{}.tmp", std::process::id()));
-    if std::fs::write(&temporary, manifest).is_ok() {
-        let _ = std::fs::rename(temporary, path);
+    for (name, content) in [("app.toml", manifest.as_str()), ("skill.md", SKILL_MD)] {
+        let path = dir.join(name);
+        // Rewrite only on change so repeated launches do not churn watchers.
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(content) {
+            continue;
+        }
+        let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, content).is_ok() {
+            let _ = std::fs::rename(temporary, path);
+        }
     }
 }
 
@@ -90,6 +133,14 @@ mod tests {
         assert!(APP_TOML.contains("command_aliases = [\"unpeel-markdown\"]"));
         assert!(APP_TOML.contains("process_aliases = [\"unpeel-markdown\"]"));
         assert!(APP_TOML.contains("id = \"unpeel.app.markdown\""));
+    }
+
+    #[test]
+    fn manifest_declares_the_skill_and_the_skill_documents_app_context() {
+        assert!(APP_TOML.contains("skill = \"skill.md\""));
+        assert!(SKILL_MD.contains("app_context"));
+        assert!(SKILL_MD.contains("selection_lines"));
+        assert!(SKILL_MD.contains("dirty"));
     }
 
     #[test]
@@ -116,11 +167,12 @@ mod tests {
             std::env::set_var("PATH", &bin);
         }
         ensure_installed();
-        let manifest =
-            std::fs::read_to_string(home.join("apps").join(APP_ID).join("app.toml")).unwrap();
+        let dir = home.join("apps").join(APP_ID);
+        let manifest = std::fs::read_to_string(dir.join("app.toml")).unwrap();
         assert!(manifest.contains("command = \"unpeel-markdown\""));
         assert!(manifest.contains("command_aliases = [\"unpeel-markdown\"]"));
         assert!(manifest.contains("process_aliases = [\"unpeel-markdown\"]"));
+        assert!(dir.join("skill.md").is_file());
 
         match previous_home {
             Some(value) => unsafe { std::env::set_var("UNPEEL_HOME", value) },

@@ -8,6 +8,10 @@
 //!   `last-hook-event.json` seed so the latch survives frontend restarts.
 //! - **Status text**: the `status.json` marker in the session dir — atomic
 //!   whole-file overwrite, debounced, announced on the state bus.
+//! - **Live context**: the `app-context.json` marker — what the App is
+//!   showing (open file, cursor line, selection), surfaced by Unpeel as
+//!   this pane's `app_context` on MCP pane-context queries. Read on
+//!   demand, so written without a state-bus ping.
 //!
 //! Outside Unpeel every call is a silent no-op. No SDK required; this file
 //! is the whole contract and is freely copyable into any App.
@@ -77,6 +81,8 @@ pub struct StatusReporter {
     host: Option<Host>,
     last_written: Option<(Instant, String)>,
     pending: Option<String>,
+    context_last: Option<(Instant, String)>,
+    context_pending: Option<String>,
 }
 
 impl StatusReporter {
@@ -85,6 +91,8 @@ impl StatusReporter {
             host: Host::detect(),
             last_written: None,
             pending: None,
+            context_last: None,
+            context_pending: None,
         }
     }
 
@@ -134,6 +142,49 @@ impl StatusReporter {
         if let Some(text) = self.pending.take() {
             self.write_status(&text);
         }
+        if let Some(entry) = self.context_pending.take() {
+            self.write_context(&entry);
+        }
+    }
+
+    /// Publish this App's live context (open file, cursor line, selection) as
+    /// the `app-context.json` marker in the session dir. Unpeel reads it
+    /// fresh on pane-context queries and surfaces it verbatim as this pane's
+    /// `app_context` on `sessions current` / `apps context` neighbor entries
+    /// — read-on-demand data, so unlike status there is no state-changed
+    /// ping. Safe to call per keystroke: identical payloads write nothing
+    /// and rapid-fire changes coalesce like status.
+    pub fn set_context(&mut self, app_id: &str, context: &serde_json::Value) {
+        if self.host.is_none() {
+            return;
+        }
+        let entry = format!(r#""app":{},"context":{context}"#, json_string(app_id));
+        if let Some((_, last)) = &self.context_last {
+            if *last == entry && self.context_pending.is_none() {
+                return;
+            }
+        }
+        if let Some((at, _)) = &self.context_last {
+            if at.elapsed() < DEBOUNCE {
+                self.context_pending = Some(entry);
+                return;
+            }
+        }
+        self.write_context(&entry);
+    }
+
+    fn write_context(&mut self, entry: &str) {
+        let Some(host) = &self.host else { return };
+        // Never create the session dir — the session may already be gone.
+        if !host.session_dir.is_dir() {
+            return;
+        }
+        let body = format!(r#"{{{entry},"updated_at":{}}}"#, now_ms());
+        let tmp = host.session_dir.join(".app-context.json.tmp");
+        let _ = std::fs::write(&tmp, body)
+            .and_then(|_| std::fs::rename(&tmp, host.session_dir.join("app-context.json")));
+        self.context_pending = None;
+        self.context_last = Some((Instant::now(), entry.to_string()));
     }
 
     /// Report what this App is currently showing ("hero.md", a picked note,
@@ -219,6 +270,58 @@ fn now_ms() -> u128 {
 
 fn json_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reporter_for(dir: &std::path::Path) -> StatusReporter {
+        StatusReporter {
+            host: Some(Host {
+                session_id: "test-session".into(),
+                session_dir: dir.to_path_buf(),
+                app_port: None,
+                port_registry: dir.join("no-ports"),
+            }),
+            last_written: None,
+            pending: None,
+            context_last: None,
+            context_pending: None,
+        }
+    }
+
+    #[test]
+    fn set_context_writes_and_coalesces_the_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut reporter = reporter_for(temp.path());
+        let marker = temp.path().join("app-context.json");
+
+        let context = serde_json::json!({
+            "file": "/notes/todo.md",
+            "cursor_line": 12,
+            "selection_lines": [4, 9],
+            "dirty": false,
+        });
+        reporter.set_context("unpeel.app.markdown", &context);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(written["app"], "unpeel.app.markdown");
+        assert_eq!(written["context"], context);
+        assert!(written["updated_at"].as_u64().is_some());
+
+        // An identical payload writes nothing; a changed one lands within
+        // the debounce via pending + flush.
+        std::fs::remove_file(&marker).unwrap();
+        reporter.set_context("unpeel.app.markdown", &context);
+        assert!(!marker.exists(), "identical context must not rewrite");
+        let moved = serde_json::json!({ "file": "/notes/todo.md", "cursor_line": 13 });
+        reporter.set_context("unpeel.app.markdown", &moved);
+        reporter.flush();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(written["context"]["cursor_line"], 13);
+    }
 }
 
 /// Fire-and-forget local POST to every registered instance. Failures are

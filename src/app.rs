@@ -96,12 +96,41 @@ impl App<'_> {
         Ok(app)
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    pub fn run(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        status: &mut crate::unpeel::StatusReporter,
+    ) -> io::Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
+            self.publish_context(status);
             self.handle_events()?;
         }
+        status.flush();
         Ok(())
+    }
+
+    /// Live context for agents: which note is open, where the cursor is,
+    /// what is selected, and whether the buffer has unsaved edits. Debounced
+    /// and deduplicated by the reporter, so per-iteration calls are cheap.
+    fn publish_context(&self, status: &mut crate::unpeel::StatusReporter) {
+        let file = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let folder = file.parent().map(|parent| parent.display().to_string());
+        let (row, _) = self.textarea.cursor();
+        let selection_lines = self.textarea.selection_range().map(|(start, end)| {
+            let (low, high) = if start <= end { (start, end) } else { (end, start) };
+            [low.0 + 1, high.0 + 1]
+        });
+        status.set_context(
+            crate::install::APP_ID,
+            &serde_json::json!({
+                "file": file.display().to_string(),
+                "folder": folder,
+                "cursor_line": row + 1,
+                "selection_lines": selection_lines,
+                "dirty": self.dirty,
+            }),
+        );
     }
 
     fn draw(&mut self, frame: &mut Frame) {
