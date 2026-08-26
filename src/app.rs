@@ -134,14 +134,9 @@ impl App<'_> {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [header, main, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+        let [main, footer] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
-        self.draw_header(frame, header);
         self.draw_editor(frame, main);
         self.draw_empty_hint(frame, main);
         self.draw_footer(frame, footer);
@@ -149,13 +144,6 @@ impl App<'_> {
         if self.mode == Mode::Menu {
             self.draw_menu(frame, main);
         }
-    }
-
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(self.header_line()).style(Style::new().fg(self.theme.text)),
-            area,
-        );
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
@@ -303,9 +291,9 @@ impl App<'_> {
         }
     }
 
-    fn header_line(&self) -> Line<'_> {
+    fn footer_line(&self) -> Line<'_> {
         let (row, col) = self.textarea.cursor();
-        Line::from(vec![
+        let mut spans: Vec<Span> = vec![
             " ".into(),
             Span::styled(file_name(&self.path), Style::new().fg(self.theme.strong)),
             if self.dirty {
@@ -317,16 +305,13 @@ impl App<'_> {
                 format!("{}:{}", row + 1, col + 1),
                 Style::new().fg(self.theme.muted),
             ),
-        ])
-    }
-
-    fn footer_line(&self) -> Line<'_> {
+            "   ".into(),
+        ];
         let message = self
             .status
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
             .map(|(text, _)| text.as_str());
-        let mut spans: Vec<Span> = vec![" ".into()];
         if let Some(message) = message {
             spans.push(message.into());
         } else if self.mode == Mode::Menu {
@@ -1301,32 +1286,31 @@ mod tests {
     }
 
     #[test]
-    fn header_places_document_top_left_and_shortcuts_bottom_left() {
+    fn footer_places_document_and_shortcuts_at_the_bottom_left() {
         let width = 80;
         let buffer = render_app(Theme::dark(), width, 8);
-        let header = row_text(&buffer, 0);
+        let top = row_text(&buffer, 0);
         let footer = row_text(&buffer, 7);
         let shortcuts = "/ insert  ^S save  Esc quit";
 
-        assert!(header.starts_with(" demo.md ✓  1:1"));
-        assert!(!header.contains(shortcuts));
-        assert!(footer.starts_with(&format!(" {shortcuts}")));
-        assert!(!footer.contains("demo.md"));
+        assert!(!top.contains("demo.md"));
+        assert!(footer.starts_with(" demo.md ✓  1:1"));
+        assert!(footer.contains(shortcuts));
     }
 
     #[test]
     fn light_and_dark_renders_use_their_contrast_palettes() {
         for theme in [Theme::light(), Theme::dark()] {
             let buffer = render_app(theme, 80, 8);
-            assert_eq!(buffer[(1, 0)].fg, theme.strong, "document title color");
+            assert_eq!(buffer[(1, 7)].fg, theme.strong, "document title color");
             let heading_x = (0..buffer.area.width)
-                .find(|&x| buffer[(x, 1)].symbol() == "#")
+                .find(|&x| buffer[(x, 0)].symbol() == "#")
                 .expect("first editor row contains a heading");
-            assert_eq!(buffer[(heading_x, 1)].fg, theme.strong, "heading color");
+            assert_eq!(buffer[(heading_x, 0)].fg, theme.strong, "heading color");
             let body_x = (0..buffer.area.width)
-                .find(|&x| buffer[(x, 3)].symbol() == "O")
+                .find(|&x| buffer[(x, 2)].symbol() == "O")
                 .expect("third editor row contains body copy");
-            assert_eq!(buffer[(body_x, 3)].fg, theme.text, "body color");
+            assert_eq!(buffer[(body_x, 2)].fg, theme.text, "body color");
         }
     }
 }

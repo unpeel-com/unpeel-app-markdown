@@ -117,17 +117,35 @@ pub fn resolve_folder_input(input: &str) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
-/// First-run folder chooser. It deliberately starts empty: the example is a
-/// hint, never an implicit current-directory or demo selection.
+fn user_path(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
+        if path == home {
+            return "~".to_string();
+        }
+        if let Ok(relative) = path.strip_prefix(home) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn default_folder_input() -> String {
+    let folder = std::env::current_dir()
+        .map(|path| path.join("docs"))
+        .unwrap_or_else(|_| PathBuf::from("docs"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    user_path(&folder, home.as_deref())
+}
+
+/// First-run folder chooser. The project's `docs` folder is prefilled so it
+/// can be accepted with Enter, while still allowing a different path.
 pub fn choose_workspace(
     terminal: &mut DefaultTerminal,
     theme: Theme,
 ) -> io::Result<Option<PathBuf>> {
-    let mut value = String::new();
+    let mut value = default_folder_input();
     let mut error: Option<String> = None;
-    let example = std::env::current_dir()
-        .map(|path| format!("For example: {}/notes", path.display()))
-        .unwrap_or_else(|_| "For example: /path/to/project/notes".to_string());
+    let hint = "Press Enter to use this folder, or edit the path";
     loop {
         terminal.draw(|frame| {
             let width = frame.area().width.saturating_sub(4).clamp(20, 78);
@@ -193,7 +211,7 @@ pub fn choose_workspace(
                 y: input.y,
             });
             frame.render_widget(
-                Paragraph::new(example.as_str()).style(Style::new().fg(theme.faint)),
+                Paragraph::new(hint).style(Style::new().fg(theme.faint)),
                 example_row,
             );
             if let Some(message) = error.as_deref() {
@@ -283,5 +301,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_workspace_at(&state), None);
+    }
+
+    #[test]
+    fn paths_inside_home_use_a_tilde_prefix() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            user_path(Path::new("/Users/alice/Dev/project/docs"), Some(home)),
+            "~/Dev/project/docs"
+        );
+        assert_eq!(user_path(home, Some(home)), "~");
+        assert_eq!(
+            user_path(Path::new("/opt/project/docs"), Some(home)),
+            "/opt/project/docs"
+        );
     }
 }
