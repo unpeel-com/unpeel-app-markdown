@@ -1,7 +1,7 @@
 //! Markdown selection helpers that remain App-specific.
 //!
 //! Wrapped terminal hit-testing and scroll state live in
-//! `unpeel_tui_kit::MarkdownTextArea`.
+//! `unpeel_app_kit::MarkdownTextArea`.
 
 pub fn word_bounds(line: &str, col: usize) -> (usize, usize) {
     let chars: Vec<char> = line.chars().collect();

@@ -13,7 +13,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unicode_width::UnicodeWidthChar;
-use unpeel_tui_kit::{MarkdownTextArea, MarkdownTextAreaStyle};
+use unpeel_app_kit::{MarkdownTextArea, MarkdownTextAreaStyle};
 
 use crate::block::{self, BlockKind, EnterAction};
 use crate::clipboard;
