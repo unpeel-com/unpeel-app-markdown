@@ -1,2 +1,5 @@
-# A new note
-
+---
+cover: "#cccc"
+title: "A new note"
+description: ""
+---

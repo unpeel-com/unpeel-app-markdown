@@ -1,5 +1,8 @@
-# Markdown editor demo
-
+---
+cover: "#cccc"
+title: "Markdown editor demo"
+description: "A hands-on tour of blocks, formatting, and terminal-native editing."
+---
 Open this file automatically when you run the app with no arguments.
 
 Click to place the cursor. Drag to select. Double-click a word, triple-click a line. Shift+arrows still work. **Backspace** deletes the selection, or the character before the cursor.

@@ -3,6 +3,7 @@ mod backend;
 mod block;
 mod clipboard;
 mod format;
+mod frontmatter;
 mod heading;
 mod highlight;
 mod install;

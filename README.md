@@ -4,7 +4,10 @@ A beautiful terminal markdown editor built with [Ratatui](https://ratatui.rs).
 Live block styling, a headings picker, slash commands on empty lines
 (`/` for headings, lists, to-dos, quotes, code, dividers), `[] ` to start a
 to-do, full mouse support (click, drag-select, double/triple-click), and a
-searchable note picker when you open a folder.
+searchable note picker when you open a folder. YAML frontmatter becomes a
+Notion-style cover, title, and description card: click a field or press
+`Ctrl+T` to edit the title inline, and press `Ctrl+Shift+V` to toggle the
+literal Markdown source (`F2` also works; `Ctrl+V` remains paste).
 
 ```
 unpeel-markdown notes/hello.md    # edit one file

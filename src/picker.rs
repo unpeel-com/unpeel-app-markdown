@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::frontmatter::{self, Metadata};
 use crate::theme::Theme;
 
 struct Entry {
@@ -400,7 +401,12 @@ fn create_note(root: &Path, name: &str) -> Result<PathBuf, String> {
                 error.to_string()
             }
         })?;
-    if let Err(error) = writeln!(file, "# {title}\n") {
+    let mut contents =
+        frontmatter::compose_lines(&Metadata::new(title), &[String::new()]).join("\n");
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if let Err(error) = file.write_all(contents.as_bytes()) {
         drop(file);
         let _ = std::fs::remove_file(&path);
         return Err(error.to_string());
@@ -609,7 +615,7 @@ mod tests {
         assert_eq!(path, root.path().join("project-brief.md"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# Project Brief\n\n"
+            "---\ncover: \"#cccc\"\ntitle: \"Project Brief\"\ndescription: \"\"\n---\n"
         );
         assert!(create_note(root.path(), "Project Brief.md").is_err());
         assert_eq!(note_stem("../../Secrets"), Ok("secrets".to_string()));
