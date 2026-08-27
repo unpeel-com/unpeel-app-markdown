@@ -1734,6 +1734,7 @@ dependencies = [
 name = "unpeel-tui-kit"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "ratatui",
  "serde",
  "serde_json",
