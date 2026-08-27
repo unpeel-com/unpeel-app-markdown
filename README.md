@@ -8,6 +8,9 @@ searchable note picker when you open a folder. YAML frontmatter becomes a
 Notion-style cover, title, and description card: click a field or press
 `Ctrl+T` to edit the title inline, and press `Ctrl+Shift+V` to toggle the
 literal Markdown source (`F2` also works; `Ctrl+V` remains paste).
+Hex cover colors fill the entire top banner. HTTP(S) image URLs are accepted
+and retained as remote-cover placeholders, with the banner boundary ready for
+a future Kitty graphics image background.
 
 ```
 unpeel-markdown notes/hello.md    # edit one file

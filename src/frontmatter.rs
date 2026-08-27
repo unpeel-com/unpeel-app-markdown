@@ -6,6 +6,17 @@
 
 pub const DEFAULT_COVER: &str = "#cccc";
 
+/// A cover value after classifying the frontmatter scalar.
+///
+/// Keeping remote images distinct gives the UI a stable hand-off point for a
+/// future Kitty graphics renderer without changing the stored frontmatter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverSource<'a> {
+    Color(u8, u8, u8),
+    Url(&'a str),
+    Unsupported(&'a str),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Metadata {
     pub cover: String,
@@ -133,6 +144,32 @@ pub fn cover_rgb(value: &str) -> Option<(u8, u8, u8)> {
     }
 }
 
+/// Recognize the cover formats understood by the card renderer. HTTP(S) URLs
+/// are preserved as-is; the terminal UI currently draws a placeholder for
+/// them and can later paint the same cover rectangle with Kitty graphics.
+pub fn cover_source(value: &str) -> CoverSource<'_> {
+    let value = value.trim();
+    if let Some((r, g, b)) = cover_rgb(value) {
+        return CoverSource::Color(r, g, b);
+    }
+    if is_http_url(value) {
+        CoverSource::Url(value)
+    } else {
+        CoverSource::Unsupported(value)
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        value
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            && value
+                .get(scheme.len()..)
+                .is_some_and(|remainder| !remainder.trim().is_empty())
+    })
+}
+
 fn expand_hex(digit: char) -> Option<u8> {
     let value = digit.to_digit(16)? as u8;
     Some(value * 17)
@@ -207,5 +244,27 @@ mod tests {
         assert_eq!(cover_rgb("#12ab34"), Some((18, 171, 52)));
         assert_eq!(cover_rgb("not-a-color"), None);
         assert_eq!(cover_rgb("#aébcd"), None);
+    }
+
+    #[test]
+    fn cover_sources_distinguish_colors_urls_and_unknown_values() {
+        assert_eq!(cover_source(" #abc "), CoverSource::Color(170, 187, 204));
+        assert_eq!(
+            cover_source("https://example.com/cover image.jpg"),
+            CoverSource::Url("https://example.com/cover image.jpg")
+        );
+        assert_eq!(
+            cover_source("HTTP://example.com/cover.png"),
+            CoverSource::Url("HTTP://example.com/cover.png")
+        );
+        assert_eq!(
+            cover_source("https://"),
+            CoverSource::Unsupported("https://")
+        );
+        assert_eq!(
+            cover_source("https://   "),
+            CoverSource::Unsupported("https://")
+        );
+        assert_eq!(cover_source("blue"), CoverSource::Unsupported("blue"));
     }
 }

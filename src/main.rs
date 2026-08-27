@@ -14,7 +14,7 @@ mod start;
 mod theme;
 mod unpeel;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use app::App;
 use backend::BackendCapture;
@@ -75,14 +75,14 @@ fn main() -> color_eyre::Result<()> {
 
 /// Sidebar status line: which note is open. Editing is user-paced typing, so
 /// this App never claims Busy — the status text is the live surface.
-fn editing_status(path: &PathBuf) -> String {
+fn editing_status(path: &Path) -> String {
     format!("editing {}", display_name(path))
 }
 
 /// Agent-facing context while the user browses the vault: the folder, with
 /// no open file. Editing context comes from the editor loop itself.
-fn browsing_context(vault: &PathBuf) -> serde_json::Value {
-    let folder = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.clone());
+fn browsing_context(vault: &Path) -> serde_json::Value {
+    let folder = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
     serde_json::json!({
         "file": null,
         "folder": folder.display().to_string(),
@@ -91,11 +91,11 @@ fn browsing_context(vault: &PathBuf) -> serde_json::Value {
 
 /// The session-title form of a path: the file or folder name. "." resolves
 /// to the real directory name so a bare vault launch titles usefully.
-fn display_name(path: &PathBuf) -> String {
+fn display_name(path: &Path) -> String {
     let resolved = if path.as_os_str() == "." {
-        std::env::current_dir().unwrap_or_else(|_| path.clone())
+        std::env::current_dir().unwrap_or_else(|_| path.to_path_buf())
     } else {
-        path.clone()
+        path.to_path_buf()
     };
     resolved
         .file_name()

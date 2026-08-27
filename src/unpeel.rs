@@ -63,10 +63,10 @@ impl Host {
         let mut ports: Vec<u16> = self.app_port.into_iter().collect();
         if let Ok(raw) = std::fs::read_to_string(&self.port_registry) {
             for line in raw.lines() {
-                if let Ok(port) = line.trim().parse::<u16>() {
-                    if !ports.contains(&port) {
-                        ports.push(port);
-                    }
+                if let Ok(port) = line.trim().parse::<u16>()
+                    && !ports.contains(&port)
+                {
+                    ports.push(port);
                 }
             }
         }
@@ -124,16 +124,17 @@ impl StatusReporter {
             return;
         }
         let text = text.trim().replace(['\n', '\r'], " ");
-        if let Some((_, last)) = &self.last_written {
-            if *last == text && self.pending.is_none() {
-                return;
-            }
+        if let Some((_, last)) = &self.last_written
+            && *last == text
+            && self.pending.is_none()
+        {
+            return;
         }
-        if let Some((at, _)) = &self.last_written {
-            if at.elapsed() < DEBOUNCE {
-                self.pending = Some(text);
-                return;
-            }
+        if let Some((at, _)) = &self.last_written
+            && at.elapsed() < DEBOUNCE
+        {
+            self.pending = Some(text);
+            return;
         }
         self.write_status(&text);
     }
@@ -159,16 +160,17 @@ impl StatusReporter {
             return;
         }
         let entry = format!(r#""app":{},"context":{context}"#, json_string(app_id));
-        if let Some((_, last)) = &self.context_last {
-            if *last == entry && self.context_pending.is_none() {
-                return;
-            }
+        if let Some((_, last)) = &self.context_last
+            && *last == entry
+            && self.context_pending.is_none()
+        {
+            return;
         }
-        if let Some((at, _)) = &self.context_last {
-            if at.elapsed() < DEBOUNCE {
-                self.context_pending = Some(entry);
-                return;
-            }
+        if let Some((at, _)) = &self.context_last
+            && at.elapsed() < DEBOUNCE
+        {
+            self.context_pending = Some(entry);
+            return;
         }
         self.write_context(&entry);
     }
@@ -272,6 +274,28 @@ fn json_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
 
+/// Fire-and-forget local POST to every registered instance. Failures are
+/// ignored: a port whose owner has gone is normal.
+fn post_json(host: &Host, path: &str, body: &str) {
+    for port in host.ports() {
+        let address = format!("127.0.0.1:{port}");
+        let Ok(target) = address.parse() else {
+            continue;
+        };
+        let Ok(mut stream) = TcpStream::connect_timeout(&target, IO_TIMEOUT) else {
+            continue;
+        };
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(request.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,27 +345,5 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
         assert_eq!(written["context"]["cursor_line"], 13);
-    }
-}
-
-/// Fire-and-forget local POST to every registered instance. Failures are
-/// ignored: a port whose owner has gone is normal.
-fn post_json(host: &Host, path: &str, body: &str) {
-    for port in host.ports() {
-        let address = format!("127.0.0.1:{port}");
-        let Ok(target) = address.parse() else {
-            continue;
-        };
-        let Ok(mut stream) = TcpStream::connect_timeout(&target, IO_TIMEOUT) else {
-            continue;
-        };
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(request.as_bytes());
-        let _ = stream.flush();
     }
 }

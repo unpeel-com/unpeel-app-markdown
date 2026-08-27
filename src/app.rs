@@ -6,13 +6,14 @@ use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
-use tui_textarea::{CursorMove, CursorRenderMode, Input, Key, TextArea};
+use tui_textarea::{CursorMove, Input, Key};
 use unicode_width::UnicodeWidthChar;
+use unpeel_tui_kit::{MarkdownTextArea, MarkdownTextAreaStyle};
 
 use crate::block::{self, BlockKind, EnterAction};
 use crate::clipboard;
@@ -24,8 +25,9 @@ use crate::mouse;
 use crate::slash::{self, ItemId, MenuHit, MenuOrigin};
 use crate::theme::Theme;
 
-const EDITOR_LEFT_PADDING: u16 = 1;
-const CARD_HEIGHT: u16 = 6;
+const COVER_HEIGHT: u16 = 5;
+const CARD_DETAILS_HEIGHT: u16 = 4;
+const CARD_HEIGHT: u16 = COVER_HEIGHT + CARD_DETAILS_HEIGHT;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -55,6 +57,7 @@ struct FieldHit {
 #[derive(Clone, Copy, Default)]
 struct CardHit {
     area: Rect,
+    cover_area: Rect,
     cover: FieldHit,
     title: FieldHit,
     description: FieldHit,
@@ -81,7 +84,7 @@ struct DragState {
 
 pub struct App<'a> {
     path: PathBuf,
-    textarea: TextArea<'a>,
+    textarea: MarkdownTextArea<'a>,
     frontmatter: Metadata,
     view: DocumentView,
     card_focus: Option<CardField>,
@@ -94,8 +97,6 @@ pub struct App<'a> {
     dirty: bool,
     exit: bool,
     status: Option<(String, Instant)>,
-    editor_inner: Rect,
-    scroll_top: (u16, u16),
     drag: Option<DragState>,
     last_click: Option<(Instant, u16, u16, u8)>,
 }
@@ -108,8 +109,7 @@ impl App<'_> {
             String::new()
         };
         let document = frontmatter::parse(&contents, &document_title(&path));
-        let mut textarea = TextArea::from(document.body);
-        configure_textarea(&mut textarea, theme);
+        let mut textarea = MarkdownTextArea::new(document.body, markdown_text_area_style(theme));
         highlight::refresh(&mut textarea, theme);
 
         let is_new = !path.exists();
@@ -128,8 +128,6 @@ impl App<'_> {
             dirty: false,
             exit: false,
             status: None,
-            editor_inner: Rect::default(),
-            scroll_top: (0, 0),
             drag: None,
             last_click: None,
         };
@@ -229,8 +227,9 @@ impl App<'_> {
             return editor;
         }
 
+        let cover_height = card.height.saturating_sub(CARD_DETAILS_HEIGHT);
         let [cover, title_row, description_row, _, divider] = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(cover_height),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -242,17 +241,17 @@ impl App<'_> {
             width: row.width.saturating_sub(4),
             ..row
         };
-        let cover_field = field_area(Rect { height: 1, ..cover });
+        let cover_field = field_area(Rect {
+            y: cover.bottom().saturating_sub(1),
+            height: cover.height.min(1),
+            ..cover
+        });
         let title = field_area(title_row);
         let description = field_area(description_row);
 
-        let (cover_bg, cover_fg) = cover_colors(&self.frontmatter.cover, self.theme);
-        let cover_fill =
-            vec![Line::from(" ".repeat(usize::from(cover.width))); cover.height.into()];
-        frame.render_widget(
-            Paragraph::new(cover_fill).style(Style::new().bg(cover_bg).fg(cover_fg)),
-            cover,
-        );
+        let cover_source = frontmatter::cover_source(&self.frontmatter.cover);
+        let (cover_bg, cover_fg) = cover_colors(cover_source, self.theme);
+        draw_cover_surface(frame, cover, cover_source, cover_bg, cover_fg);
 
         let cover_hit = draw_card_field(
             frame,
@@ -291,6 +290,7 @@ impl App<'_> {
         );
         self.card_hit = CardHit {
             area: card,
+            cover_area: cover,
             cover: cover_hit,
             title: title_hit,
             description: description_hit,
@@ -299,118 +299,14 @@ impl App<'_> {
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
-        let left_padding = EDITOR_LEFT_PADDING.min(area.width);
-        let content = Rect {
-            x: area.x.saturating_add(left_padding),
-            width: area.width.saturating_sub(left_padding),
-            ..area
-        };
-        let gutter = mouse::gutter_width(self.textarea.lines().len());
-        let viewport = usize::from(content.height);
-        let preview_rows = mouse::visual_rows(
-            self.textarea.lines(),
-            mouse::wrap_width(content.width, gutter),
-            self.textarea.tab_length(),
-        );
-        let overflow = preview_rows.len() > viewport && viewport > 0;
-        let body = if overflow {
-            Rect {
-                width: content.width.saturating_sub(1),
-                ..content
-            }
-        } else {
-            content
-        };
-        self.editor_inner = body;
-        self.clamp_scroll();
-
-        let gutter_area = Rect {
-            x: body.x,
-            y: body.y,
-            width: gutter.min(body.width),
-            height: body.height,
-        };
-        let text_area = Rect {
-            x: body.x.saturating_add(gutter_area.width),
-            y: body.y,
-            width: body.width.saturating_sub(gutter_area.width),
-            height: body.height,
-        };
         highlight::refresh(&mut self.textarea, self.theme);
-        frame.render_widget(&self.textarea, text_area);
-        self.sync_scroll();
-        self.draw_gutter(frame, gutter_area);
-        if overflow {
-            self.draw_scrollbar(frame, area, viewport);
-        }
-
         let show_cursor = self.card_focus.is_none()
             && (self.mode == Mode::Edit
                 || self
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.origin == MenuOrigin::Slash));
-        if show_cursor && let Some(position) = self.textarea.rendered_cursor_position() {
-            frame.set_cursor_position(position);
-        }
-    }
-
-    fn draw_gutter(&self, frame: &mut Frame, area: Rect) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let lines = self.textarea.lines();
-        let gutter = mouse::gutter_width(lines.len());
-        let width = mouse::wrap_width(self.editor_inner.width, gutter);
-        let rows = mouse::visual_rows(lines, width, self.textarea.tab_length());
-        let top = usize::from(self.scroll_top.0);
-        let digits = usize::from(mouse::line_number_digits(lines.len()));
-        let current = self.textarea.cursor().0;
-
-        let numbered: Vec<Line> = (0..usize::from(area.height))
-            .map(|i| {
-                let Some(row) = rows.get(top + i) else {
-                    return Line::from("");
-                };
-                if row.start_col != 0 {
-                    return Line::from("");
-                }
-                let label = format!("{:>digits$}  ", row.line + 1);
-                if row.line == current {
-                    Line::from(Span::styled(label, Style::new().fg(self.theme.muted)))
-                } else {
-                    Line::from(Span::styled(label, Style::new().fg(self.theme.faint)))
-                }
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(numbered), area);
-    }
-
-    fn draw_scrollbar(&self, frame: &mut Frame, area: Rect, viewport: usize) {
-        let gutter = mouse::gutter_width(self.textarea.lines().len());
-        let rows = mouse::visual_rows(
-            self.textarea.lines(),
-            mouse::wrap_width(self.editor_inner.width, gutter),
-            self.textarea.tab_length(),
-        );
-        let Some(content_length) = scrollbar_content_length(rows.len(), viewport) else {
-            return;
-        };
-        let position = usize::from(self.scroll_top.0).min(content_length.saturating_sub(1));
-        let mut state = ScrollbarState::new(content_length)
-            .position(position)
-            .viewport_content_length(viewport);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_symbol(Some("│"))
-                .track_style(Style::default().fg(self.theme.faint))
-                .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(self.theme.muted)),
-            area,
-            &mut state,
-        );
+        self.textarea.render(frame, area, show_cursor);
     }
 
     fn draw_menu(&mut self, frame: &mut Frame, area: Rect) {
@@ -559,16 +455,13 @@ impl App<'_> {
             MouseEventKind::Up(MouseButton::Left) => self.on_mouse_up(),
             MouseEventKind::ScrollDown if self.menu_contains(point) => self.move_menu(1),
             MouseEventKind::ScrollUp if self.menu_contains(point) => self.move_menu(-1),
-            MouseEventKind::ScrollDown if self.editor_inner.contains(point) => {
-                if self.scroll_top.0 < self.max_scroll() {
-                    let _ = self.textarea.input(Input::from(mouse));
-                    self.scroll_top.0 = self.scroll_top.0.saturating_add(1);
-                    self.clamp_scroll();
-                }
+            MouseEventKind::ScrollDown if self.textarea.contains(point) => {
+                self.textarea
+                    .scroll_lines_with_selection(1, mouse.modifiers.contains(KeyModifiers::SHIFT));
             }
-            MouseEventKind::ScrollUp if self.editor_inner.contains(point) => {
-                let _ = self.textarea.input(Input::from(mouse));
-                self.scroll_top.0 = self.scroll_top.0.saturating_sub(1);
+            MouseEventKind::ScrollUp if self.textarea.contains(point) => {
+                self.textarea
+                    .scroll_lines_with_selection(-1, mouse.modifiers.contains(KeyModifiers::SHIFT));
             }
             _ => {}
         }
@@ -598,10 +491,10 @@ impl App<'_> {
             self.card_focus = None;
             self.card_select_all = false;
         }
-        if !self.editor_inner.contains(point) {
+        if !self.textarea.contains(point) {
             return;
         }
-        let (row, col) = self.hit(point.x, point.y);
+        let (row, col) = self.textarea.hit_test(point);
         if self.click_checkbox(row, col) {
             return;
         }
@@ -655,15 +548,8 @@ impl App<'_> {
         let kind = drag.kind;
         let anchor_start = drag.anchor_start;
         let anchor_end = drag.anchor_end;
-        if point.y < self.editor_inner.y {
-            self.textarea.scroll((-1i16, 0i16));
-            self.scroll_top.0 = self.scroll_top.0.saturating_sub(1);
-        } else if point.y >= self.editor_inner.bottom() && self.scroll_top.0 < self.max_scroll() {
-            self.textarea.scroll((1i16, 0i16));
-            self.scroll_top.0 = self.scroll_top.0.saturating_add(1);
-            self.clamp_scroll();
-        }
-        let (row, col) = self.hit(point.x, point.y);
+        self.textarea.auto_scroll(point);
+        let (row, col) = self.textarea.hit_test(point);
         match kind {
             DragKind::Char => self.jump(row, col),
             DragKind::Word => {
@@ -697,66 +583,6 @@ impl App<'_> {
             self.textarea.cancel_selection();
         }
         self.drag = None;
-    }
-
-    fn hit(&self, column: u16, row: u16) -> (usize, usize) {
-        let lines = self.textarea.lines();
-        let gutter = mouse::gutter_width(lines.len());
-        let width = mouse::wrap_width(self.editor_inner.width, gutter);
-        mouse::hit_test(
-            mouse::HitContext {
-                lines,
-                inner: self.editor_inner,
-                scroll_top: self.scroll_top,
-                gutter,
-                width,
-                tab_len: self.textarea.tab_length(),
-            },
-            column,
-            row,
-        )
-    }
-
-    fn sync_scroll(&mut self) {
-        let Some(rendered) = self.textarea.rendered_cursor_position() else {
-            self.clamp_scroll();
-            return;
-        };
-        let lines = self.textarea.lines();
-        let gutter = mouse::gutter_width(lines.len());
-        let width = mouse::wrap_width(self.editor_inner.width, gutter);
-        if let Some(scroll) = mouse::infer_scroll(
-            lines,
-            self.editor_inner,
-            gutter,
-            width,
-            self.textarea.tab_length(),
-            self.textarea.cursor(),
-            rendered,
-        ) {
-            self.scroll_top = scroll;
-        }
-        self.clamp_scroll();
-    }
-
-    fn max_scroll(&self) -> u16 {
-        if self.editor_inner.height == 0 {
-            return 0;
-        }
-        let gutter = mouse::gutter_width(self.textarea.lines().len());
-        let width = mouse::wrap_width(self.editor_inner.width, gutter);
-        let rows = mouse::visual_rows(self.textarea.lines(), width, self.textarea.tab_length());
-        max_scroll_offset(rows.len(), usize::from(self.editor_inner.height)) as u16
-    }
-
-    fn clamp_scroll(&mut self) {
-        let max = self.max_scroll();
-        if self.scroll_top.0 <= max {
-            return;
-        }
-        let extra = self.scroll_top.0 - max;
-        self.textarea.scroll((-(extra as i16), 0i16));
-        self.scroll_top.0 = max;
     }
 
     fn register_click(&mut self, x: u16, y: u16) -> u8 {
@@ -1011,7 +837,6 @@ impl App<'_> {
                 self.card_focus = None;
                 self.card_select_all = false;
                 self.card_hit = CardHit::default();
-                self.scroll_top = (0, 0);
                 highlight::refresh(&mut self.textarea, self.theme);
                 self.flash("Markdown source — Ctrl+Shift+V returns to the card");
             }
@@ -1033,7 +858,6 @@ impl App<'_> {
                 self.frontmatter = document.metadata;
                 self.textarea.set_lines(document.body, body_cursor);
                 self.view = DocumentView::Card;
-                self.scroll_top = (0, 0);
                 highlight::refresh(&mut self.textarea, self.theme);
                 if let Some(field) = field {
                     self.focus_card_field(field, None);
@@ -1232,6 +1056,9 @@ impl App<'_> {
                 hit.start_col + char_col_at_width(self.card_value(field), hit.start_col, local_x);
             return Some((field, cursor));
         }
+        if self.card_hit.cover_area.contains(point) {
+            return Some((CardField::Cover, self.frontmatter.cover.chars().count()));
+        }
         None
     }
 
@@ -1257,8 +1084,7 @@ impl App<'_> {
             return;
         }
         self.path = PathBuf::from("untitled.md");
-        self.textarea = TextArea::from([""]);
-        configure_textarea(&mut self.textarea, self.theme);
+        self.textarea = MarkdownTextArea::new([""], markdown_text_area_style(self.theme));
         highlight::refresh(&mut self.textarea, self.theme);
         self.frontmatter = Metadata::new("Untitled");
         self.view = DocumentView::Card;
@@ -1838,8 +1664,38 @@ fn char_to_byte(value: &str, column: usize) -> usize {
         .unwrap_or(value.len())
 }
 
-fn cover_colors(value: &str, theme: Theme) -> (Color, Color) {
-    let Some((r, g, b)) = frontmatter::cover_rgb(value) else {
+fn draw_cover_surface(
+    frame: &mut Frame,
+    area: Rect,
+    source: frontmatter::CoverSource<'_>,
+    background: Color,
+    foreground: Color,
+) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new("").style(Style::new().bg(background).fg(foreground)),
+        area,
+    );
+
+    // This dedicated edge-to-edge rectangle is the seam for a future Kitty
+    // graphics backend: paint a URL image here, then retain the field overlay.
+    if matches!(source, frontmatter::CoverSource::Url(_)) && area.height >= 3 {
+        let label = Rect {
+            y: area.y + area.height / 2,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new("remote image cover")
+                .alignment(Alignment::Center)
+                .style(Style::new().bg(background).fg(foreground).italic()),
+            label,
+        );
+    }
+}
+
+fn cover_colors(source: frontmatter::CoverSource<'_>, theme: Theme) -> (Color, Color) {
+    let frontmatter::CoverSource::Color(r, g, b) = source else {
         return (theme.cursor_line, theme.muted);
     };
     let lightness = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1_000;
@@ -1861,7 +1717,7 @@ fn card_field_label(field: CardField) -> &'static str {
 
 fn card_field_limit(field: CardField) -> usize {
     match field {
-        CardField::Cover => 32,
+        CardField::Cover => 2_048,
         CardField::Title => 240,
         CardField::Description => 500,
     }
@@ -1915,31 +1771,17 @@ fn input_from_key(key: KeyEvent) -> Input {
     input
 }
 
-fn configure_textarea(textarea: &mut TextArea<'_>, theme: Theme) {
-    textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
-    textarea.set_wrap_mode(tui_textarea::WrapMode::WordOrGlyph);
-    textarea.set_tab_length(2);
-    textarea.remove_line_number();
-    textarea.set_cursor_line_style(Style::new().bg(theme.cursor_line));
-    textarea.set_cursor_style(Style::new().bg(theme.cursor).fg(theme.cursor_text));
-    // Built-in selection is unstyled; rainbow paint lives in highlight::refresh.
-    textarea.set_selection_style(Style::new());
-    textarea.set_placeholder_text("Type '/' for commands");
-    textarea.set_max_histories(500);
-}
-
-/// Scroll positions, not rows: last thumb sits on the bottom when the last
-/// visual row is visible. Matches unpeel-tui's sidebar scrollbar.
-fn scrollbar_content_length(row_count: usize, viewport: usize) -> Option<usize> {
-    if row_count <= viewport || viewport == 0 {
-        None
-    } else {
-        Some(row_count - viewport + 1)
+fn markdown_text_area_style(theme: Theme) -> MarkdownTextAreaStyle {
+    MarkdownTextAreaStyle {
+        cursor_line: Style::new().bg(theme.cursor_line),
+        cursor: Style::new().bg(theme.cursor).fg(theme.cursor_text),
+        // Built-in selection is unstyled; rainbow paint lives in highlight::refresh.
+        selection: Style::new(),
+        gutter: Style::new().fg(theme.faint),
+        current_gutter: Style::new().fg(theme.muted),
+        scrollbar_track: Style::new().fg(theme.faint),
+        scrollbar_thumb: Style::new().fg(theme.muted),
     }
-}
-
-fn max_scroll_offset(row_count: usize, viewport: usize) -> usize {
-    row_count.saturating_sub(viewport)
 }
 
 fn file_name(path: &Path) -> String {
@@ -1971,21 +1813,6 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_length_is_scroll_positions() {
-        assert_eq!(scrollbar_content_length(10, 10), None);
-        assert_eq!(scrollbar_content_length(10, 20), None);
-        assert_eq!(scrollbar_content_length(12, 10), Some(3));
-        assert_eq!(scrollbar_content_length(11, 10), Some(2));
-    }
-
-    #[test]
-    fn scroll_stops_when_last_row_is_visible() {
-        assert_eq!(max_scroll_offset(10, 10), 0);
-        assert_eq!(max_scroll_offset(10, 20), 0);
-        assert_eq!(max_scroll_offset(15, 10), 5);
-    }
-
-    #[test]
     fn footer_places_document_and_shortcuts_at_the_bottom_left() {
         let width = 140;
         let buffer = render_app(Theme::dark(), width, 8);
@@ -2007,10 +1834,22 @@ mod tests {
         for theme in [Theme::light(), Theme::dark()] {
             let buffer = render_app(theme, 120, 24);
             assert_eq!(buffer[(1, 23)].fg, theme.strong, "document title color");
-            assert_eq!(buffer[(0, 0)].bg, Color::Rgb(204, 204, 204), "cover color");
-            assert_eq!(buffer[(2, 2)].fg, theme.strong, "card title color");
+            for y in 0..COVER_HEIGHT {
+                for x in [0, buffer.area.width - 1] {
+                    assert_eq!(
+                        buffer[(x, y)].bg,
+                        Color::Rgb(204, 204, 204),
+                        "cover color at ({x}, {y})"
+                    );
+                }
+            }
+            assert_eq!(
+                buffer[(2, COVER_HEIGHT)].fg,
+                theme.strong,
+                "card title color"
+            );
 
-            let heading = (6..buffer.area.height - 1)
+            let heading = (CARD_HEIGHT..buffer.area.height - 1)
                 .find_map(|y| {
                     (0..buffer.area.width)
                         .find(|&x| buffer[(x, y)].symbol() == "#")
@@ -2018,7 +1857,7 @@ mod tests {
                 })
                 .expect("visible editor rows contain a heading");
             assert_eq!(buffer[heading].fg, theme.strong, "heading color");
-            let body = (6..buffer.area.height - 1)
+            let body = (CARD_HEIGHT..buffer.area.height - 1)
                 .find_map(|y| {
                     (0..buffer.area.width)
                         .find(|&x| buffer[(x, y)].symbol() == "O")
@@ -2042,6 +1881,38 @@ mod tests {
         assert!(!frame.contains("cover:"));
         assert!(!frame.contains("title:"));
         assert!(!frame.contains("description:"));
+    }
+
+    #[test]
+    fn url_cover_uses_the_full_banner_and_remains_editable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote.md");
+        let url = "https://images.example.com/wide-cover.jpg";
+        std::fs::write(
+            &path,
+            format!("---\ncover: {url:?}\ntitle: \"Remote\"\ndescription: \"\"\n---\nBody\n"),
+        )
+        .unwrap();
+        let theme = Theme::dark();
+        let mut app = App::open(path, theme).unwrap();
+        let width = 100;
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!(row_text(buffer, COVER_HEIGHT / 2).contains("remote image cover"));
+        assert!(row_text(buffer, COVER_HEIGHT - 1).contains(url));
+        for y in 0..COVER_HEIGHT {
+            assert_eq!(buffer[(0, y)].bg, theme.cursor_line);
+            assert_eq!(buffer[(width - 1, y)].bg, theme.cursor_line);
+        }
+        assert_eq!(
+            app.card_field_at(Position::new(width - 1, 0)),
+            Some((CardField::Cover, url.chars().count()))
+        );
     }
 
     #[test]

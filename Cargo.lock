@@ -1726,6 +1726,18 @@ dependencies = [
  "tempfile",
  "terminal-colorsaurus",
  "tui-textarea-2",
+ "unicode-width",
+ "unpeel-tui-kit",
+]
+
+[[package]]
+name = "unpeel-tui-kit"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tui-textarea-2",
  "unicode-segmentation",
  "unicode-width",
 ]
