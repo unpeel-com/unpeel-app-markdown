@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
     DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput, ExplorerTheme,
-    display_path_from_root,
+    ThemeMonitor, display_path_from_root,
 };
 
 use crate::theme::Theme;
@@ -25,17 +25,19 @@ use crate::theme::Theme;
 pub struct Picker {
     root: PathBuf,
     explorer: Explorer,
+    create_area: Rect,
     drags: DragSurface,
     clicks: DoubleClickTracker<PathBuf>,
     status: Option<String>,
     theme: Theme,
+    theme_monitor: ThemeMonitor,
 }
 
 impl Picker {
     pub fn open(root: PathBuf, theme: Theme) -> io::Result<Self> {
         let mut explorer = Explorer::scoped(root)?
             .with_file_extensions(["md"])?
-            .with_theme(ExplorerTheme::for_color_scheme(theme.kit.scheme));
+            .with_theme(ExplorerTheme::for_theme(theme.kit));
         explorer.set_show_path(false);
         explorer.set_filter_placeholder("Filter notes");
         let root = explorer
@@ -45,10 +47,12 @@ impl Picker {
         Ok(Self {
             root,
             explorer,
+            create_area: Rect::default(),
             drags: DragSurface::detect(),
             clicks: DoubleClickTracker::new(),
             status: None,
             theme,
+            theme_monitor: ThemeMonitor::from_theme(theme.kit),
         })
     }
 
@@ -61,6 +65,11 @@ impl Picker {
             self.drags.commit()?;
             while !event::poll(Duration::from_millis(250))? {
                 self.drags.heartbeat()?;
+                if self.theme_monitor.refresh() {
+                    self.theme = Theme::from_kit(self.theme_monitor.theme());
+                    self.explorer
+                        .set_theme(ExplorerTheme::for_theme(self.theme.kit));
+                }
             }
             match event::read()? {
                 Event::Key(key)
@@ -69,9 +78,8 @@ impl Picker {
                     if let Some(choice) = self.on_key(key) {
                         match choice {
                             Choice::Open(path) => return Ok(Some(path)),
-                            Choice::Create => {
+                            Choice::Create(folder) => {
                                 self.clear_drag_map()?;
-                                let folder = self.explorer.cwd().to_path_buf();
                                 if let Some(path) = prompt_new_note(terminal, &folder, self.theme)?
                                 {
                                     return Ok(Some(path));
@@ -86,9 +94,8 @@ impl Picker {
                     if let Some(choice) = self.on_mouse(mouse) {
                         match choice {
                             Choice::Open(path) => return Ok(Some(path)),
-                            Choice::Create => {
+                            Choice::Create(folder) => {
                                 self.clear_drag_map()?;
-                                let folder = self.explorer.cwd().to_path_buf();
                                 if let Some(path) = prompt_new_note(terminal, &folder, self.theme)?
                                 {
                                     return Ok(Some(path));
@@ -148,7 +155,7 @@ impl Picker {
             return self.apply_explorer(ExplorerInput::Open);
         }
         if key.code == KeyCode::Char('n') && control {
-            return Some(Choice::Create);
+            return Some(Choice::Create(self.explorer.cwd().to_path_buf()));
         }
         if self.explorer.filter_focused() {
             return match key.code {
@@ -229,7 +236,10 @@ impl Picker {
                 self.apply_explorer(ExplorerInput::Down)
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.explorer.filter_area().contains(position) {
+                if self.create_area.contains(position) {
+                    self.clicks.reset();
+                    return Some(Choice::Create(self.explorer.cwd().to_path_buf()));
+                } else if self.explorer.filter_area().contains(position) {
                     self.clicks.reset();
                     self.explorer
                         .filter_mouse_down(position, mouse.modifiers.contains(KeyModifiers::SHIFT));
@@ -283,6 +293,7 @@ impl Picker {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.create_area = Rect::default();
         let footer_rows = u16::from(area.height >= 2);
         let explorer_area = Rect::new(
             area.x,
@@ -294,9 +305,28 @@ impl Picker {
 
         if footer_rows == 1 {
             let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+            let action_width = footer
+                .width
+                .min("  + New Markdown file  Ctrl+N".len() as u16);
+            self.create_area = Rect::new(footer.x, footer.y, action_width, 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  + ", Style::new().fg(self.theme.accent).bold()),
+                    Span::styled("New Markdown file", Style::new().fg(self.theme.strong)),
+                    Span::styled("  Ctrl+N", Style::new().fg(self.theme.muted)),
+                ])),
+                self.create_area,
+            );
+
+            let details = Rect::new(
+                footer.x.saturating_add(action_width),
+                footer.y,
+                footer.width.saturating_sub(action_width),
+                1,
+            );
             let (message, style) = self.status.as_ref().map_or_else(
                 || {
-                    self.drags.register(footer, self.explorer.cwd());
+                    self.drags.register(details, self.explorer.cwd());
                     (
                         display_path_from_root(self.explorer.cwd(), &self.root),
                         Style::new().fg(self.theme.muted),
@@ -304,7 +334,7 @@ impl Picker {
                 },
                 |message| (message.clone(), Style::new().fg(self.theme.kit.danger)),
             );
-            frame.render_widget(Paragraph::new(format!("  {message}")).style(style), footer);
+            frame.render_widget(Paragraph::new(format!("  {message}")).style(style), details);
         }
 
         if let Some(position) = self.explorer.filter_cursor_position() {
@@ -315,7 +345,7 @@ impl Picker {
 
 enum Choice {
     Open(PathBuf),
-    Create,
+    Create(PathBuf),
     Quit,
 }
 
@@ -503,7 +533,23 @@ mod tests {
         assert!(picker.explorer.entries().is_empty());
         assert!(matches!(
             picker.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
-            Some(Choice::Create)
+            Some(Choice::Create(folder)) if folder == picker.root
+        ));
+    }
+
+    #[test]
+    fn new_note_command_targets_the_current_nested_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = std::fs::canonicalize(nested).unwrap();
+        let mut picker = Picker::open(root.path().to_path_buf(), Theme::dark()).unwrap();
+        picker.explorer.select_path(&nested);
+        picker.apply_explorer(ExplorerInput::Open);
+
+        assert!(matches!(
+            picker.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(Choice::Create(folder)) if folder == nested
         ));
     }
 
@@ -626,7 +672,10 @@ mod tests {
         assert!((0..width).all(|column| buffer[(column, 1)].bg == selected_background));
         assert_ne!(buffer[(0, 0)].symbol(), "┌");
         assert_ne!(buffer[(width - 1, 4)].symbol(), "┘");
-        assert_eq!(row_text(5).trim(), ".");
+        let footer = row_text(5);
+        assert!(footer.contains("+ New Markdown file"));
+        assert!(footer.contains("Ctrl+N"));
+        assert!(footer.trim_end().ends_with('.'));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -639,5 +688,16 @@ mod tests {
             matches!(picker.on_mouse(click), Some(Choice::Open(_))),
             "double click opens"
         );
+
+        let create_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: picker.create_area.x + 2,
+            row: picker.create_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            picker.on_mouse(create_click),
+            Some(Choice::Create(folder)) if folder == picker.root
+        ));
     }
 }

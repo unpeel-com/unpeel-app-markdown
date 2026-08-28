@@ -21,6 +21,7 @@ pub enum MenuOrigin {
 pub enum ItemId {
     Block(BlockKind),
     LiteralBackslash,
+    ToggleAutosave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,10 +150,19 @@ const BACKSLASH: MenuItem = MenuItem {
     primary: false,
 };
 
+const AUTOSAVE: MenuItem = MenuItem {
+    id: ItemId::ToggleAutosave,
+    shortcut: 'a',
+    name: "Toggle auto-save",
+    sample: "on / off",
+    aliases: &["autosave", "auto-save", "save", "setting"],
+    primary: false,
+};
+
 pub fn items_for(origin: MenuOrigin) -> Vec<&'static MenuItem> {
     match origin {
         MenuOrigin::Slash => ITEMS.iter().collect(),
-        MenuOrigin::Palette => ITEMS.iter().chain(std::iter::once(&BACKSLASH)).collect(),
+        MenuOrigin::Palette => ITEMS.iter().chain([&BACKSLASH, &AUTOSAVE]).collect(),
     }
 }
 
@@ -288,6 +298,7 @@ pub fn render_menu(
     frame: &mut Frame,
     bounds: Rect,
     anchor: Position,
+    origin: MenuOrigin,
     items: &[&MenuItem],
     selected: usize,
     theme: Theme,
@@ -336,9 +347,13 @@ pub fn render_menu(
         }
     }
 
+    let title = match origin {
+        MenuOrigin::Slash => " insert ",
+        MenuOrigin::Palette => " commands ",
+    };
     let widget = Paragraph::new(lines).block(
         Block::bordered()
-            .title(" insert ")
+            .title(title)
             .title_style(Style::new().fg(theme.strong).bold())
             .border_style(Style::new().fg(theme.faint)),
     );
@@ -411,6 +426,16 @@ mod tests {
             visible_items(MenuOrigin::Palette, "")
                 .iter()
                 .any(|item| item.id == ItemId::Block(BlockKind::Paragraph))
+        );
+        assert!(
+            visible_items(MenuOrigin::Palette, "")
+                .iter()
+                .any(|item| item.id == ItemId::ToggleAutosave)
+        );
+        assert!(
+            visible_items(MenuOrigin::Slash, "")
+                .iter()
+                .all(|item| item.id != ItemId::ToggleAutosave)
         );
     }
 }

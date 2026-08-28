@@ -40,7 +40,7 @@ fn state_path(app_id: &str) -> Option<PathBuf> {
     Some(config_root()?.join(app_id).join("start.json"))
 }
 
-fn read_workspace_at(path: &Path) -> Option<PathBuf> {
+fn read_state_at(path: &Path) -> Option<serde_json::Value> {
     let raw = std::fs::read(path).ok()?;
     if raw.len() > 16 * 1024 {
         return None;
@@ -49,6 +49,11 @@ fn read_workspace_at(path: &Path) -> Option<PathBuf> {
     if state.get("version")?.as_u64()? != STATE_VERSION {
         return None;
     }
+    Some(state)
+}
+
+fn read_workspace_at(path: &Path) -> Option<PathBuf> {
+    let state = read_state_at(path)?;
     let workspace = PathBuf::from(state.get("workspace")?.as_str()?);
     workspace.is_dir().then_some(workspace)
 }
@@ -57,18 +62,33 @@ pub fn read_workspace(app_id: &str) -> Option<PathBuf> {
     read_workspace_at(&state_path(app_id)?)
 }
 
-fn write_workspace_at(path: &Path, workspace: &Path) -> io::Result<()> {
+fn read_autosave_at(path: &Path) -> bool {
+    read_state_at(path)
+        .and_then(|state| state.get("autosave").and_then(serde_json::Value::as_bool))
+        .unwrap_or(true)
+}
+
+pub fn read_autosave(app_id: &str) -> bool {
+    state_path(app_id).is_none_or(|path| read_autosave_at(&path))
+}
+
+fn write_state_at(path: &Path, workspace: Option<&Path>, autosave: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("start state has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "version": STATE_VERSION,
-        "workspace": workspace.to_string_lossy(),
+        "workspace": workspace.map(|path| path.to_string_lossy().into_owned()),
+        "autosave": autosave,
     }))?;
     let temporary = parent.join(format!(".start.json.{}.tmp", std::process::id()));
     std::fs::write(&temporary, body)?;
     std::fs::rename(temporary, path)
+}
+
+fn write_workspace_at(path: &Path, workspace: &Path) -> io::Result<()> {
+    write_state_at(path, Some(workspace), read_autosave_at(path))
 }
 
 pub fn write_workspace(app_id: &str, workspace: &Path) -> io::Result<()> {
@@ -79,6 +99,21 @@ pub fn write_workspace(app_id: &str, workspace: &Path) -> io::Result<()> {
         ));
     };
     write_workspace_at(&path, workspace)
+}
+
+fn write_autosave_at(path: &Path, enabled: bool) -> io::Result<()> {
+    let workspace = read_workspace_at(path);
+    write_state_at(path, workspace.as_deref(), enabled)
+}
+
+pub fn write_autosave(app_id: &str, enabled: bool) -> io::Result<()> {
+    let Some(path) = state_path(app_id) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no home directory available for start state",
+        ));
+    };
+    write_autosave_at(&path, enabled)
 }
 
 pub fn resolve_folder_input(input: &str) -> io::Result<PathBuf> {
@@ -277,6 +312,23 @@ mod tests {
         assert_eq!(read_workspace_at(&state), Some(workspace.clone()));
         std::fs::remove_dir(workspace).unwrap();
         assert_eq!(read_workspace_at(&state), None);
+    }
+
+    #[test]
+    fn autosave_defaults_on_and_persists_without_losing_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("notes");
+        std::fs::create_dir(&workspace).unwrap();
+        let state = temp.path().join("state/start.json");
+
+        assert!(read_autosave_at(&state));
+        write_workspace_at(&state, &workspace).unwrap();
+        write_autosave_at(&state, false).unwrap();
+        assert!(!read_autosave_at(&state));
+        assert_eq!(read_workspace_at(&state), Some(workspace.clone()));
+
+        write_workspace_at(&state, &workspace).unwrap();
+        assert!(!read_autosave_at(&state));
     }
 
     #[test]

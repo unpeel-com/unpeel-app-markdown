@@ -11,7 +11,6 @@ mod picker;
 mod slash;
 mod start;
 mod theme;
-mod unpeel;
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +18,7 @@ use app::App;
 use backend::BackendCapture;
 use picker::Picker;
 use theme::Theme;
-use unpeel_app_kit::KeyboardEnhancementGuard;
+use unpeel_app_kit::{AppReporter, KeyboardEnhancementGuard};
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -32,14 +31,9 @@ fn main() -> color_eyre::Result<()> {
             println!("unpeel-markdown {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Some(argument) if argument == "--register" => {
-            install::ensure_installed();
-            return Ok(());
-        }
         _ => {}
     }
-    install::ensure_installed();
-    let mut status = unpeel::StatusReporter::detect();
+    let mut status = AppReporter::detect(install::APP_ID);
     status.idle();
     let explicit_path = std::env::args().nth(1).map(PathBuf::from);
     let theme = Theme::detect();
@@ -65,17 +59,18 @@ fn main() -> color_eyre::Result<()> {
             // while editing, the vault folder while browsing.
             let vault_title = display_name(&path);
             status.set_title(&vault_title);
-            status.set_context(install::APP_ID, &browsing_context(&path));
+            status.set_context(&browsing_context(&path));
             status.flush();
             let mut picker = Picker::open(path.clone(), theme)?;
             while let Some(file) = picker.pick(terminal)? {
                 status.set_title(&display_name(&file));
                 status.set_status(&editing_status(&file));
                 status.flush();
-                App::open(file, theme)?.run(terminal, &mut status)?;
+                App::open_with_autosave(file, theme, start::read_autosave(install::APP_ID))?
+                    .run(terminal, &mut status)?;
                 status.set_title(&vault_title);
                 status.set_status("browsing notes");
-                status.set_context(install::APP_ID, &browsing_context(&path));
+                status.set_context(&browsing_context(&path));
                 status.flush();
             }
             Ok(())
@@ -83,7 +78,8 @@ fn main() -> color_eyre::Result<()> {
             status.set_title(&display_name(&path));
             status.set_status(&editing_status(&path));
             status.flush();
-            App::open(path, theme)?.run(terminal, &mut status)
+            App::open_with_autosave(path, theme, start::read_autosave(install::APP_ID))?
+                .run(terminal, &mut status)
         }
     })?;
     Ok(())

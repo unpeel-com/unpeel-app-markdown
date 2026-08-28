@@ -31,7 +31,7 @@ impl Theme {
         Self::from_kit(KitTheme::light())
     }
 
-    const fn from_kit(kit: KitTheme) -> Self {
+    pub(crate) const fn from_kit(kit: KitTheme) -> Self {
         let (cursor_line, cursor_text) = match kit.scheme {
             ColorScheme::Dark => (Color::Rgb(28, 28, 28), Color::Black),
             ColorScheme::Light => (Color::Rgb(244, 244, 245), Color::White),

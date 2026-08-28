@@ -12,7 +12,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
-use unpeel_app_kit::{MarkdownTextArea, MarkdownTextAreaStyle};
+use unpeel_app_kit::{
+    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownTextArea,
+    MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu, ThemeMonitor,
+};
 
 use crate::block::{self, BlockKind, EnterAction};
 use crate::clipboard;
@@ -22,6 +25,8 @@ use crate::highlight;
 use crate::mouse;
 use crate::slash::{self, ItemId, MenuHit, MenuOrigin};
 use crate::theme::Theme;
+
+const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -34,6 +39,14 @@ struct BlockMenu {
     selected: usize,
     hit: Option<MenuHit>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ContextAction {
+    SendToAgent(String),
+    CopyReference(String),
+}
+
+type ContextMenu = PopupMenu<ContextAction>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragKind {
@@ -52,9 +65,16 @@ pub struct App<'a> {
     path: PathBuf,
     textarea: MarkdownTextArea<'a>,
     theme: Theme,
+    theme_monitor: ThemeMonitor,
+    drop_target: DropTargetSurface,
     mode: Mode,
     menu: Option<BlockMenu>,
+    context_menu: Option<ContextMenu>,
+    agent: AgentBridge,
+    autosave: bool,
+    autosave_area: Rect,
     dirty: bool,
+    last_edit_at: Option<Instant>,
     exit: bool,
     status: Option<(String, Instant)>,
     drag: Option<DragState>,
@@ -62,7 +82,12 @@ pub struct App<'a> {
 }
 
 impl App<'_> {
+    #[cfg(test)]
     pub fn open(path: PathBuf, theme: Theme) -> io::Result<Self> {
+        Self::open_with_autosave(path, theme, true)
+    }
+
+    pub fn open_with_autosave(path: PathBuf, theme: Theme, autosave: bool) -> io::Result<Self> {
         let contents = if path.exists() {
             std::fs::read_to_string(&path)?
         } else {
@@ -70,22 +95,35 @@ impl App<'_> {
         };
         let mut textarea = MarkdownTextArea::new(contents.lines(), markdown_text_area_style(theme));
         highlight::refresh(&mut textarea, theme);
+        let agent = AgentBridge::new();
+        agent.refresh();
 
         let is_new = !path.exists();
         let mut app = Self {
             path,
             textarea,
             theme,
+            theme_monitor: ThemeMonitor::from_theme(theme.kit),
+            drop_target: DropTargetSurface::detect(),
             mode: Mode::Edit,
             menu: None,
+            context_menu: None,
+            agent,
+            autosave,
+            autosave_area: Rect::default(),
             dirty: false,
+            last_edit_at: None,
             exit: false,
             status: None,
             drag: None,
             last_click: None,
         };
         if is_new {
-            app.flash("new file — press Ctrl+S to create it");
+            app.flash(if autosave {
+                "new file — auto-save will create it"
+            } else {
+                "new file — press Ctrl+S to create it"
+            });
         }
         Ok(app)
     }
@@ -93,12 +131,18 @@ impl App<'_> {
     pub fn run(
         &mut self,
         terminal: &mut DefaultTerminal,
-        status: &mut crate::unpeel::StatusReporter,
+        status: &mut AppReporter,
     ) -> io::Result<()> {
         while !self.exit {
+            self.maybe_autosave();
+            self.drop_target.begin_frame();
             terminal.draw(|frame| self.draw(frame))?;
+            self.drop_target.commit()?;
             self.publish_context(status);
             self.handle_events()?;
+        }
+        if self.autosave && self.dirty {
+            self.write_document(false);
         }
         status.flush();
         Ok(())
@@ -107,7 +151,7 @@ impl App<'_> {
     /// Live context for agents: which note is open, where the cursor is,
     /// what is selected, and whether the buffer has unsaved edits. Debounced
     /// and deduplicated by the reporter, so per-iteration calls are cheap.
-    fn publish_context(&self, status: &mut crate::unpeel::StatusReporter) {
+    fn publish_context(&self, status: &mut AppReporter) {
         let file = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
         let folder = file.parent().map(|parent| parent.display().to_string());
         let (row, _) = self.textarea.cursor();
@@ -119,16 +163,14 @@ impl App<'_> {
             };
             [low.0 + 1, high.0 + 1]
         });
-        status.set_context(
-            crate::install::APP_ID,
-            &serde_json::json!({
-                "file": file.display().to_string(),
-                "folder": folder,
-                "cursor_line": row + 1,
-                "selection_lines": selection_lines,
-                "dirty": self.dirty,
-            }),
-        );
+        status.set_context(&serde_json::json!({
+            "file": file.display().to_string(),
+            "folder": folder,
+            "cursor_line": row + 1,
+            "selection_lines": selection_lines,
+            "dirty": self.dirty,
+            "autosave": self.autosave,
+        }));
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -142,23 +184,43 @@ impl App<'_> {
         if self.mode == Mode::Menu {
             self.draw_menu(frame, main);
         }
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.render(frame);
+        }
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(
             Paragraph::new(self.footer_line()).style(Style::new().fg(self.theme.text)),
             area,
+        );
+        let label = if self.autosave {
+            " auto-save on "
+        } else {
+            " auto-save off "
+        };
+        let width = (label.len() as u16).min(area.width);
+        self.autosave_area = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
+        frame.render_widget(
+            Paragraph::new(label).style(Style::new().fg(if self.autosave {
+                self.theme.accent
+            } else {
+                self.theme.muted
+            })),
+            self.autosave_area,
         );
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
         highlight::refresh(&mut self.textarea, self.theme);
-        let show_cursor = self.mode == Mode::Edit
-            || self
-                .menu
-                .as_ref()
-                .is_some_and(|menu| menu.origin == MenuOrigin::Slash);
+        let show_cursor = self.context_menu.is_none()
+            && (self.mode == Mode::Edit
+                || self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.origin == MenuOrigin::Slash));
         self.textarea.render(frame, area, show_cursor);
+        self.drop_target.register(area);
     }
 
     fn draw_menu(&mut self, frame: &mut Frame, area: Rect) {
@@ -178,7 +240,15 @@ impl App<'_> {
                 area.x.saturating_add(2),
                 area.y.saturating_add(1),
             ));
-        let hit = slash::render_menu(frame, area, anchor, &items, selected, self.theme);
+        let hit = slash::render_menu(
+            frame,
+            area,
+            anchor,
+            menu.origin,
+            &items,
+            selected,
+            self.theme,
+        );
         if let Some(menu) = self.menu.as_mut() {
             menu.selected = selected;
             menu.hit = Some(hit);
@@ -213,7 +283,14 @@ impl App<'_> {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
+        self.handle_drop_target_event()?;
         if !event::poll(Duration::from_millis(120))? {
+            self.drop_target.heartbeat()?;
+            if self.theme_monitor.refresh() {
+                self.theme = Theme::from_kit(self.theme_monitor.theme());
+                self.textarea
+                    .set_component_style(markdown_text_area_style(self.theme));
+            }
             return Ok(());
         }
         // Drain the whole queue before the next draw. Touch terminals send
@@ -225,13 +302,9 @@ impl App<'_> {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if self.handle_key_command(&key) {
-                        // command handled
-                    } else if key.kind == KeyEventKind::Press {
-                        self.handle_input(input_from_key(key));
-                    }
+                    self.handle_key_event(key);
                 }
-                Event::Paste(text) => self.paste_text(&text),
+                Event::Paste(text) if self.context_menu.is_none() => self.paste_text(&text),
                 Event::Mouse(mouse) => self.handle_mouse(mouse),
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -242,10 +315,72 @@ impl App<'_> {
         }
     }
 
+    fn handle_drop_target_event(&mut self) -> io::Result<()> {
+        let Some(event) = self.drop_target.poll()? else {
+            return Ok(());
+        };
+        match event {
+            DropTargetEvent::Hover { position } => {
+                self.prepare_for_drop();
+                self.textarea.position_drop_cursor(position);
+            }
+            DropTargetEvent::Leave => {}
+            DropTargetEvent::Drop {
+                position,
+                text,
+                references,
+            } => {
+                self.prepare_for_drop();
+                self.textarea.position_drop_cursor(position);
+                let text = if text.is_empty() {
+                    references.join(" ")
+                } else {
+                    text
+                };
+                self.paste_text(&text);
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_for_drop(&mut self) {
+        self.mode = Mode::Edit;
+        self.menu = None;
+        self.context_menu = None;
+        self.drag = None;
+        self.last_click = None;
+    }
+
+    fn handle_key_event(&mut self, key: KeyEvent) {
+        if is_control_c(&key) {
+            self.exit = true;
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.handle_context_menu_key(key);
+            return;
+        }
+        if !self.handle_key_command(&key) {
+            self.handle_input(input_from_key(key));
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let point = Position::new(mouse.column, mouse.row);
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(point),
+            MouseEventKind::Down(MouseButton::Left) if self.context_menu.is_some() => {
+                self.click_context_menu(point)
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.autosave_area.contains(point) => {
+                self.toggle_autosave()
+            }
             MouseEventKind::Down(MouseButton::Left) => self.on_mouse_down(point, mouse.modifiers),
+            MouseEventKind::Moved if self.context_menu.is_some() => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.hover_at(point);
+                }
+            }
             MouseEventKind::Moved => {
                 self.hover_menu(point);
                 if self.drag.is_some() {
@@ -256,6 +391,16 @@ impl App<'_> {
                 self.on_mouse_drag(point);
             }
             MouseEventKind::Up(MouseButton::Left) => self.on_mouse_up(),
+            MouseEventKind::ScrollDown if self.context_menu.is_some() => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_selection(1);
+                }
+            }
+            MouseEventKind::ScrollUp if self.context_menu.is_some() => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_selection(-1);
+                }
+            }
             MouseEventKind::ScrollDown if self.menu_contains(point) => self.move_menu(1),
             MouseEventKind::ScrollUp if self.menu_contains(point) => self.move_menu(-1),
             MouseEventKind::ScrollDown if self.textarea.contains(point) => {
@@ -267,6 +412,97 @@ impl App<'_> {
                     .scroll_lines_with_selection(-1, mouse.modifiers.contains(KeyModifiers::SHIFT));
             }
             _ => {}
+        }
+    }
+
+    fn handle_context_menu_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.context_menu = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_selection(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.move_selection(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if key.kind == KeyEventKind::Press => {
+                self.activate_context_menu();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_context_menu(&mut self, point: Position) {
+        if !self.textarea.contains(point) {
+            self.context_menu = None;
+            return;
+        }
+        if self.mode == Mode::Menu {
+            self.close_menu(false);
+        }
+        let clicked = self.textarea.hit_test(point);
+        let selection = normalized_selection(self.textarea.selection_range());
+        if !selection.is_some_and(|range| selection_contains(range, clicked)) {
+            self.textarea.cancel_selection();
+            self.jump(clicked.0, clicked.1);
+        }
+        let rows = heading::selected_rows(
+            self.textarea.cursor(),
+            normalized_selection(self.textarea.selection_range()),
+            self.textarea.lines().len(),
+        );
+        let reference = line_reference(&self.path, rows);
+        self.agent.refresh();
+        self.context_menu = Some(editor_context_menu(
+            reference,
+            self.agent.label().is_some(),
+            point,
+            self.theme,
+        ));
+        self.drag = None;
+        self.last_click = None;
+    }
+
+    fn click_context_menu(&mut self, point: Position) {
+        let activate = self.context_menu.as_mut().is_some_and(|menu| {
+            let enabled = menu.item_at(point).is_some_and(MenuItem::is_enabled);
+            if enabled {
+                menu.select_at(point);
+            }
+            enabled
+        });
+        if activate {
+            self.activate_context_menu();
+        } else {
+            self.context_menu = None;
+        }
+    }
+
+    fn activate_context_menu(&mut self) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let Some(action) = menu.selected_value().cloned() else {
+            return;
+        };
+        match action {
+            ContextAction::SendToAgent(reference) => match self.agent.send_reference(&reference) {
+                Ok(label) => self.flash(format!("Sent reference to {label}")),
+                Err(error) if clipboard::write(&reference) => {
+                    self.flash(format!("{error}; reference copied instead"))
+                }
+                Err(error) => self.flash(format!("{error}; copy failed")),
+            },
+            ContextAction::CopyReference(reference) => {
+                if clipboard::write(&reference) {
+                    self.flash("reference copied");
+                } else {
+                    self.flash("copy failed");
+                }
+            }
         }
     }
 
@@ -450,6 +686,13 @@ impl App<'_> {
                 key: Key::Backspace,
                 ..
             } => self.handle_backspace(),
+            input @ Input {
+                key: Key::Down,
+                ctrl: false,
+                alt: false,
+                shift: false,
+                ..
+            } => self.handle_down(input),
             Input {
                 key: Key::Tab,
                 shift: true,
@@ -567,7 +810,29 @@ impl App<'_> {
         self.textarea = MarkdownTextArea::new([""], markdown_text_area_style(self.theme));
         highlight::refresh(&mut self.textarea, self.theme);
         self.dirty = false;
-        self.flash("new file");
+        self.last_edit_at = None;
+        self.flash(if self.autosave {
+            "new file — auto-save on"
+        } else {
+            "new file — auto-save off"
+        });
+    }
+
+    fn toggle_autosave(&mut self) {
+        self.autosave = !self.autosave;
+        self.mode = Mode::Edit;
+        self.menu = None;
+        self.context_menu = None;
+        if self.autosave && self.dirty {
+            self.last_edit_at = Some(Instant::now());
+        }
+        let state = if self.autosave { "on" } else { "off" };
+        match crate::start::write_autosave(crate::install::APP_ID, self.autosave) {
+            Ok(()) => self.flash(format!("auto-save {state}")),
+            Err(error) => self.flash(format!(
+                "auto-save {state}; preference save failed: {error}"
+            )),
+        }
     }
 
     fn duplicate_line(&mut self) {
@@ -678,6 +943,11 @@ impl App<'_> {
                 key: Key::Char('0'),
                 ..
             } => self.apply_kind(BlockKind::Paragraph),
+            Input {
+                key: Key::Char('a'),
+                ctrl: false,
+                ..
+            } if origin == Some(MenuOrigin::Palette) => self.toggle_autosave(),
             other if origin == Some(MenuOrigin::Slash) => {
                 if self.textarea.input(other) {
                     self.after_edit();
@@ -702,6 +972,7 @@ impl App<'_> {
 
     fn open_menu(&mut self, origin: MenuOrigin) {
         self.mode = Mode::Menu;
+        self.context_menu = None;
         self.menu = Some(BlockMenu {
             origin,
             selected: 0,
@@ -811,6 +1082,7 @@ impl App<'_> {
                 self.textarea.insert_char('\\');
                 self.after_edit();
             }
+            ItemId::ToggleAutosave => self.toggle_autosave(),
         }
     }
 
@@ -860,6 +1132,25 @@ impl App<'_> {
                 });
                 self.after_edit();
             }
+        }
+    }
+
+    fn handle_down(&mut self, input: Input) {
+        let (row, _) = self.textarea.cursor();
+        let append_trailing_line = !self.textarea.is_selecting()
+            && row + 1 == self.textarea.lines().len()
+            && self
+                .textarea
+                .lines()
+                .get(row)
+                .is_some_and(|line| !line.is_empty());
+        if append_trailing_line {
+            self.textarea.move_cursor(CursorMove::End);
+            self.textarea.insert_newline();
+            self.after_edit();
+        } else if self.textarea.input(input) {
+            self.after_edit();
+            self.apply_markdown_shortcut();
         }
     }
 
@@ -976,10 +1267,26 @@ impl App<'_> {
 
     fn after_edit(&mut self) {
         self.dirty = true;
+        self.last_edit_at = Some(Instant::now());
         highlight::refresh(&mut self.textarea, self.theme);
     }
 
+    fn maybe_autosave(&mut self) {
+        if self.autosave
+            && self.dirty
+            && self
+                .last_edit_at
+                .is_some_and(|edited| edited.elapsed() >= AUTOSAVE_DELAY)
+        {
+            self.write_document(false);
+        }
+    }
+
     fn save(&mut self) {
+        self.write_document(true);
+    }
+
+    fn write_document(&mut self, announce: bool) -> bool {
         let mut text = self.textarea.lines().join("\n");
         if !text.ends_with('\n') {
             text.push('\n');
@@ -987,14 +1294,89 @@ impl App<'_> {
         match std::fs::write(&self.path, text) {
             Ok(()) => {
                 self.dirty = false;
-                self.flash(format!("saved {}", self.path.display()));
+                self.last_edit_at = None;
+                if announce {
+                    self.flash(format!("saved {}", self.path.display()));
+                }
+                true
             }
-            Err(error) => self.flash(format!("save failed: {error}")),
+            Err(error) => {
+                self.last_edit_at = Some(Instant::now());
+                self.flash(format!("save failed: {error}"));
+                false
+            }
         }
     }
 
     fn flash(&mut self, message: impl Into<String>) {
         self.status = Some((message.into(), Instant::now()));
+    }
+}
+
+fn editor_context_menu(
+    reference: String,
+    can_send: bool,
+    anchor: Position,
+    theme: Theme,
+) -> ContextMenu {
+    let mut items = Vec::with_capacity(2);
+    if can_send {
+        items.push(MenuItem::new(
+            "Send to agent",
+            ContextAction::SendToAgent(reference.clone()),
+        ));
+    }
+    items.push(MenuItem::new(
+        "Copy reference",
+        ContextAction::CopyReference(reference),
+    ));
+    PopupMenu::new(anchor, items).with_theme(MenuTheme::for_color_scheme(theme.kit.scheme))
+}
+
+fn normalized_selection(
+    selection: Option<((usize, usize), (usize, usize))>,
+) -> Option<((usize, usize), (usize, usize))> {
+    selection.map(|(start, end)| {
+        if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        }
+    })
+}
+
+fn selection_contains(selection: ((usize, usize), (usize, usize)), point: (usize, usize)) -> bool {
+    selection.0 < selection.1 && selection.0 <= point && point < selection.1
+}
+
+fn line_reference(path: &Path, rows: (usize, usize)) -> String {
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|directory| directory.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    });
+    let working_directory = std::env::current_dir()
+        .ok()
+        .and_then(|directory| std::fs::canonicalize(directory).ok());
+    let shown = working_directory
+        .as_deref()
+        .and_then(|directory| absolute.strip_prefix(directory).ok())
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(absolute.as_path())
+        .to_string_lossy()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let first = rows.0.saturating_add(1);
+    let last = rows.1.saturating_add(1);
+    if first == last {
+        format!("{shown}:{first}")
+    } else {
+        format!("{shown}:{first}-{last}")
     }
 }
 
@@ -1010,6 +1392,11 @@ fn is_command_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(
         KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META | KeyModifiers::HYPER,
     )
+}
+
+fn is_control_c(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'c'))
 }
 
 fn input_from_key(key: KeyEvent) -> Input {
@@ -1090,7 +1477,7 @@ mod tests {
                         .map(|x| (x, y))
                 })
                 .expect("visible editor rows contain a heading");
-            assert_eq!(buffer[heading].fg, theme.strong, "heading color");
+            assert_eq!(buffer[heading].fg, theme.kit.accent, "heading color");
             let body = (0..buffer.area.height - 1)
                 .find_map(|y| {
                     (0..buffer.area.width)
@@ -1162,5 +1549,140 @@ mod tests {
         assert!(!app.handle_key_command(&KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE,)));
         app.save();
         assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[test]
+    fn autosave_writes_a_dirty_buffer_after_the_idle_delay() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("autosave.md");
+        std::fs::write(&path, "before\n").unwrap();
+        let mut app = App::open_with_autosave(path.clone(), Theme::dark(), true).unwrap();
+        app.textarea.move_cursor(CursorMove::End);
+        app.textarea.insert_str(" after");
+        app.after_edit();
+        app.last_edit_at = Some(Instant::now() - AUTOSAVE_DELAY);
+
+        app.maybe_autosave();
+
+        assert!(!app.dirty);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before after\n");
+    }
+
+    #[test]
+    fn disabled_autosave_leaves_the_dirty_buffer_on_disk_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manual.md");
+        std::fs::write(&path, "before\n").unwrap();
+        let mut app = App::open_with_autosave(path.clone(), Theme::dark(), false).unwrap();
+        app.textarea.move_cursor(CursorMove::End);
+        app.textarea.insert_str(" after");
+        app.after_edit();
+        app.last_edit_at = Some(Instant::now() - AUTOSAVE_DELAY);
+
+        app.maybe_autosave();
+
+        assert!(app.dirty);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn repeated_backspace_events_delete_one_character_each() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repeat.md");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.textarea.move_cursor(CursorMove::End);
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Backspace, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        app.handle_key_event(repeat);
+        app.handle_key_event(repeat);
+
+        assert_eq!(app.textarea.lines(), ["a"]);
+    }
+
+    #[test]
+    fn repeated_arrow_events_keep_moving_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repeat.md");
+        std::fs::write(&path, "abcd\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.textarea.move_cursor(CursorMove::End);
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        app.handle_key_event(repeat);
+        app.handle_key_event(repeat);
+
+        assert_eq!(app.textarea.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn down_from_the_final_content_line_appends_only_one_empty_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("down.md");
+        std::fs::write(&path, "last line\n").unwrap();
+        let mut app = App::open_with_autosave(path, Theme::dark(), false).unwrap();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+
+        app.handle_key_event(down);
+        app.handle_key_event(down);
+
+        assert_eq!(app.textarea.lines(), ["last line", ""]);
+        assert_eq!(app.textarea.cursor(), (1, 0));
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn control_c_exits_even_while_the_context_menu_is_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("exit.md");
+        std::fs::write(&path, "text\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.context_menu = Some(editor_context_menu(
+            "exit.md:1".to_string(),
+            false,
+            Position::new(0, 0),
+            Theme::dark(),
+        ));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(app.exit);
+    }
+
+    #[test]
+    fn editor_context_menu_matches_the_diff_viewer_agent_handoff() {
+        let reference = "notes/demo.md:2-4".to_string();
+        let anchor = Position::new(4, 4);
+        let with_agent = editor_context_menu(reference.clone(), true, anchor, Theme::dark());
+        assert_eq!(with_agent.items().len(), 2);
+        assert_eq!(with_agent.items()[0].label(), "Send to agent");
+        assert_eq!(
+            with_agent.items()[0].value(),
+            &ContextAction::SendToAgent(reference.clone())
+        );
+        assert_eq!(with_agent.items()[1].label(), "Copy reference");
+
+        let without_agent = editor_context_menu(reference.clone(), false, anchor, Theme::dark());
+        assert_eq!(without_agent.items().len(), 1);
+        assert_eq!(without_agent.items()[0].label(), "Copy reference");
+        assert_eq!(
+            without_agent.items()[0].value(),
+            &ContextAction::CopyReference(reference)
+        );
+    }
+
+    #[test]
+    fn line_references_include_the_clicked_or_selected_markdown_rows() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.md");
+        assert_eq!(line_reference(&path, (0, 0)), "demo.md:1");
+        assert_eq!(line_reference(&path, (1, 3)), "demo.md:2-4");
+        assert!(selection_contains(((1, 2), (3, 4)), (2, 0)));
+        assert!(!selection_contains(((1, 2), (3, 4)), (3, 4)));
+        assert_eq!(
+            normalized_selection(Some(((3, 4), (1, 2)))),
+            Some(((1, 2), (3, 4)))
+        );
     }
 }

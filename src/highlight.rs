@@ -232,7 +232,7 @@ fn push_span(
 
 fn heading_style(theme: Theme) -> Style {
     Style::default()
-        .fg(theme.strong)
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -282,8 +282,12 @@ mod tests {
 
     #[test]
     fn highlights_heading_and_inline_code() {
-        let marks = collect(&["# Title".into(), "use `code` here".into()], Theme::dark());
-        assert!(marks.iter().any(|(range, _, _)| *range == ((0, 0), (0, 7))));
+        let theme = Theme::dark();
+        let marks = collect(&["# Title".into(), "use `code` here".into()], theme);
+        assert!(marks.iter().any(|(range, style, _)| {
+            *range == ((0, 0), (0, 7)) && *style == heading_style(theme)
+        }));
+        assert_eq!(heading_style(theme).fg, Some(theme.kit.accent));
         assert!(
             marks
                 .iter()
