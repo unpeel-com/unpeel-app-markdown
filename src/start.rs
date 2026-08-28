@@ -172,7 +172,6 @@ pub fn choose_workspace(
                 example_row,
                 error_row,
                 _,
-                help,
             ] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -181,7 +180,6 @@ pub fn choose_workspace(
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Fill(1),
-                Constraint::Length(1),
             ])
             .areas(inner);
             frame.render_widget(
@@ -220,11 +218,6 @@ pub fn choose_workspace(
                     error_row,
                 );
             }
-            frame.render_widget(
-                Paragraph::new("Enter continue · Ctrl+U clear · Esc quit")
-                    .style(Style::new().fg(theme.muted)),
-                help,
-            );
             let _ = spacer;
         })?;
 

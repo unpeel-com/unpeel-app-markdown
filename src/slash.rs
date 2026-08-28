@@ -343,10 +343,6 @@ pub fn render_menu(
         Block::bordered()
             .title(" insert ")
             .title_style(Style::new().fg(theme.strong).bold())
-            .title_bottom(Line::from(Span::styled(
-                " ↑↓  ⏎ apply  esc ",
-                Style::new().fg(theme.muted),
-            )))
             .border_style(Style::new().fg(theme.faint)),
     );
     frame.render_widget(Clear, area);

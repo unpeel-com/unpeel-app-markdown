@@ -20,6 +20,7 @@ use app::App;
 use backend::BackendCapture;
 use picker::Picker;
 use theme::Theme;
+use unpeel_app_kit::KeyboardEnhancementGuard;
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -29,6 +30,7 @@ fn main() -> color_eyre::Result<()> {
     let explicit_path = std::env::args().nth(1).map(PathBuf::from);
     let theme = Theme::detect();
     ratatui::run(|terminal| {
+        let _keyboard = KeyboardEnhancementGuard::enter()?;
         let _capture = BackendCapture::enable(terminal)?;
         let path = match explicit_path.clone() {
             Some(path) => path,

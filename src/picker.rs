@@ -236,8 +236,7 @@ impl Picker {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [main, status] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+        let main = frame.area();
         let title = format!(" {} — {} notes ", self.name, self.entries.len());
         let block = Block::bordered()
             .title(Span::styled(title, Style::new().fg(self.theme.muted)))
@@ -316,22 +315,6 @@ impl Picker {
                 );
             }
         }
-
-        let hints = Line::from(vec![
-            Span::styled(
-                " type to search · Ctrl+N new · ↑↓ move · enter open · esc ",
-                Style::new().fg(self.theme.muted),
-            ),
-            Span::styled(
-                if self.query.is_empty() {
-                    "quit"
-                } else {
-                    "clear"
-                },
-                Style::new().fg(self.theme.muted),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(hints), status);
     }
 
     fn row_line(&self, entry: &Entry, positions: &[usize], selected: bool) -> Line<'static> {
@@ -439,14 +422,13 @@ fn prompt_new_note(
                 .border_style(Style::new().fg(theme.faint));
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            let [description, spacer, input, target, error_row, _, help] = Layout::vertical([
+            let [description, spacer, input, target, error_row, _] = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Fill(1),
-                Constraint::Length(1),
             ])
             .areas(inner);
             frame.render_widget(
@@ -483,11 +465,6 @@ fn prompt_new_note(
                     error_row,
                 );
             }
-            frame.render_widget(
-                Paragraph::new("Enter create · Ctrl+U clear · Esc back")
-                    .style(Style::new().fg(theme.muted)),
-                help,
-            );
             let _ = spacer;
         })?;
 

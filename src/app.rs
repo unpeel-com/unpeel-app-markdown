@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
@@ -367,44 +367,6 @@ impl App<'_> {
             .map(|(text, _)| text.as_str());
         if let Some(message) = message {
             spans.push(message.into());
-        } else if self.card_focus.is_some() {
-            spans.extend([
-                "↑↓".bold(),
-                Span::styled(" fields  ", Style::new().fg(self.theme.muted)),
-                "Esc".bold(),
-                Span::styled(" body  ", Style::new().fg(self.theme.muted)),
-                "^⇧V".bold(),
-                Span::styled(" source", Style::new().fg(self.theme.muted)),
-            ]);
-        } else if self.mode == Mode::Menu {
-            spans.extend([
-                "↑↓".bold(),
-                Span::styled(" select  ", Style::new().fg(self.theme.muted)),
-                "⏎".bold(),
-                Span::styled(" apply  ", Style::new().fg(self.theme.muted)),
-                "Esc".bold(),
-                Span::styled(" close", Style::new().fg(self.theme.muted)),
-            ]);
-        } else {
-            spans.extend([
-                "/".bold(),
-                Span::styled(" insert  ", Style::new().fg(self.theme.muted)),
-                "^T".bold(),
-                Span::styled(" title  ", Style::new().fg(self.theme.muted)),
-                "^⇧V".bold(),
-                Span::styled(
-                    if self.view == DocumentView::Card {
-                        " source  "
-                    } else {
-                        " card  "
-                    },
-                    Style::new().fg(self.theme.muted),
-                ),
-                "^S".bold(),
-                Span::styled(" save  ", Style::new().fg(self.theme.muted)),
-                "Esc".bold(),
-                Span::styled(" quit", Style::new().fg(self.theme.muted)),
-            ]);
         }
         Line::from(spans)
     }
@@ -1813,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_places_document_and_shortcuts_at_the_bottom_left() {
+    fn footer_keeps_document_status_without_shortcut_help() {
         let width = 140;
         let buffer = render_app(Theme::dark(), width, 8);
         let top = row_text(&buffer, 0);
@@ -1823,8 +1785,8 @@ mod tests {
         assert!(footer.starts_with(" demo.md ✓  1:1  CARD"));
         for shortcut in ["/ insert", "^T title", "^⇧V source", "^S save", "Esc quit"] {
             assert!(
-                footer.contains(shortcut),
-                "missing {shortcut:?} in {footer:?}"
+                !footer.contains(shortcut),
+                "unexpected {shortcut:?} in {footer:?}"
             );
         }
     }
