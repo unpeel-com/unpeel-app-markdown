@@ -164,10 +164,12 @@ fn user_path(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-fn default_folder_input() -> String {
-    let folder = std::env::current_dir()
+fn default_folder_input(project_root: Option<&Path>) -> String {
+    let folder = project_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
         .map(|path| path.join("docs"))
-        .unwrap_or_else(|_| PathBuf::from("docs"));
+        .unwrap_or_else(|| PathBuf::from("docs"));
     let home = std::env::var_os("HOME").map(PathBuf::from);
     user_path(&folder, home.as_deref())
 }
@@ -177,8 +179,9 @@ fn default_folder_input() -> String {
 pub fn choose_workspace(
     terminal: &mut DefaultTerminal,
     theme: Theme,
+    project_root: Option<&Path>,
 ) -> io::Result<Option<PathBuf>> {
-    let mut value = default_folder_input();
+    let mut value = default_folder_input(project_root);
     let mut error: Option<String> = None;
     let hint = "Press Enter to use this folder, or edit the path";
     loop {
@@ -359,6 +362,14 @@ mod tests {
         assert_eq!(
             user_path(Path::new("/opt/project/docs"), Some(home)),
             "/opt/project/docs"
+        );
+    }
+
+    #[test]
+    fn hosted_project_root_drives_the_first_run_suggestion() {
+        assert_eq!(
+            default_folder_input(Some(Path::new("/opt/current-worktree"))),
+            "/opt/current-worktree/docs"
         );
     }
 }

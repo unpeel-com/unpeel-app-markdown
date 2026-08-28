@@ -17,8 +17,11 @@ unpeel-markdown notes/            # vault mode: scoped Markdown Explorer
 unpeel-markdown                   # remembered notes folder: open or create
 ```
 
-The first bare launch asks you to choose a notes folder. Later bare launches
-always return to that folder's searchable note list, which includes a
+The first bare launch asks you to choose a notes folder. In a hosted App,
+App Kit's `AppContext::current_root()` pre-fills the active project's or
+worktree's `docs` folder; a normal terminal pre-fills `./docs`. This is only a
+suggestion: an explicit path or remembered notes folder always wins. Later
+bare launches return to that folder's searchable note list, which includes a
 **New note** action (`Ctrl+N`). The picker is App Kit's shared scoped
 `Explorer`: it keeps folders navigable, admits only `.md` files, and cannot
 leave the chosen notes root. Its shared borderless input supports a native
