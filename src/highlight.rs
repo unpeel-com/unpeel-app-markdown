@@ -1,6 +1,6 @@
 //! Lightweight markdown source highlighting for the editor buffer.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use tui_textarea::TextArea;
 
 use crate::block::{self, BlockKind};
@@ -13,15 +13,10 @@ pub fn refresh(textarea: &mut TextArea<'_>, theme: Theme) {
     for (range, style, priority) in collect(&lines, theme) {
         // tui-textarea treats custom_highlight columns as UTF-8 byte offsets and
         // slices the line with them. Cursor/selection columns are character indexes.
-        // A later custom span replaces the previous style entirely, so markdown
-        // colors must not start inside the selection or they hide the white fg.
+        // A later custom span replaces the previous style entirely, so syntax
+        // colors must not cover App Kit's foreground/background selection.
         for clipped in exclude_selection(range, selection) {
             textarea.custom_highlight(range_to_bytes(&lines, clipped), style, priority);
-        }
-    }
-    if let Some(range) = selection {
-        for (span, style) in rainbow_selection(&lines, range) {
-            textarea.custom_highlight(range_to_bytes(&lines, span), style, 200);
         }
     }
 }
@@ -44,124 +39,6 @@ fn range_to_bytes(lines: &[String], range: Range) -> Range {
         .map(|line| char_col_to_byte(line, end_col))
         .unwrap_or(0);
     ((start_row, start), (end_row, end))
-}
-
-/// Agent accents from unpeel-mascot, ramp order:
-/// claude orange → codex teal → green → kimi blue → gemini → cursor purple.
-const RAINBOW: [(u8, u8, u8); 6] = [
-    (217, 119, 87),
-    (0, 196, 196),
-    (67, 194, 81),
-    (79, 168, 255),
-    (76, 125, 247),
-    (155, 97, 234),
-];
-
-fn rainbow_selection(
-    lines: &[String],
-    range: ((usize, usize), (usize, usize)),
-) -> Vec<(Range, Style)> {
-    let (mut start, mut end) = range;
-    if start > end {
-        std::mem::swap(&mut start, &mut end);
-    }
-    if start == end {
-        return Vec::new();
-    }
-    // Left -> right per selected row segment (not top -> bottom over the whole
-    // selection). Each row's selected span gets t=0 at its left edge and t=1
-    // at its right edge.
-    let mut out = Vec::new();
-    for row in start.0..=end.0 {
-        let len = lines.get(row).map(|line| line.chars().count()).unwrap_or(0);
-        let from = if row == start.0 { start.1.min(len) } else { 0 };
-        let to = if row == end.0 { end.1.min(len) } else { len };
-        if from >= to {
-            continue;
-        }
-        let width = to - from;
-        let mut run_s = from;
-        let mut run_e = from + 1;
-        let mut run_st = rainbow_style_for_t(0.0);
-        for col in from..to {
-            let t = if width <= 1 {
-                0.0
-            } else {
-                (col - from) as f32 / (width - 1) as f32
-            };
-            let st = rainbow_style_for_t(t);
-            if col == from {
-                run_s = col;
-                run_e = col + 1;
-                run_st = st;
-                continue;
-            }
-            if col == run_e && st == run_st {
-                run_e = col + 1;
-            } else {
-                out.push((((row, run_s), (row, run_e)), run_st));
-                run_s = col;
-                run_e = col + 1;
-                run_st = st;
-            }
-        }
-        out.push((((row, run_s), (row, run_e)), run_st));
-    }
-    out
-}
-
-#[allow(dead_code)]
-fn selection_cells(
-    lines: &[String],
-    range: ((usize, usize), (usize, usize)),
-) -> Vec<(usize, usize)> {
-    let (mut start, mut end) = range;
-    if start > end {
-        std::mem::swap(&mut start, &mut end);
-    }
-    if start == end {
-        return Vec::new();
-    }
-    let mut cells = Vec::new();
-    for row in start.0..=end.0 {
-        let len = lines.get(row).map(|line| line.chars().count()).unwrap_or(0);
-        let from = if row == start.0 { start.1.min(len) } else { 0 };
-        let to = if row == end.0 { end.1.min(len) } else { len };
-        for col in from..to {
-            cells.push((row, col));
-        }
-    }
-    cells
-}
-
-#[allow(dead_code)]
-fn rainbow_style(index: usize, last: usize) -> Style {
-    let t = if last == 0 {
-        0.5
-    } else {
-        index as f32 / last as f32
-    };
-    rainbow_style_for_t(t)
-}
-
-fn rainbow_style_for_t(t: f32) -> Style {
-    let (r, g, b) = lerp_stops(t);
-    Style::new().bg(Color::Rgb(r, g, b)).fg(Color::White)
-}
-
-fn lerp_stops(t: f32) -> (u8, u8, u8) {
-    let t = t.clamp(0.0, 1.0);
-    let segs = (RAINBOW.len() - 1) as f32;
-    let x = t * segs;
-    let i = (x as usize).min(RAINBOW.len() - 2);
-    let f = x - i as f32;
-    let a = RAINBOW[i];
-    let b = RAINBOW[i + 1];
-    (lerp(a.0, b.0, f), lerp(a.1, b.1, f), lerp(a.2, b.2, f))
-}
-
-fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8
 }
 
 type Range = ((usize, usize), (usize, usize));
@@ -435,21 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn rainbow_selection_spans_the_range() {
-        let lines = ["hello world".into()];
-        let spans = rainbow_selection(&lines, ((0, 0), (0, 5)));
-        assert!(!spans.is_empty());
-        assert_eq!(spans.first().map(|(range, _)| range.0), Some((0, 0)));
-        assert_eq!(spans.last().map(|(range, _)| range.1), Some((0, 5)));
-        assert!(spans.iter().any(|(_, style)| style.bg.is_some()));
-        assert!(
-            spans
-                .iter()
-                .all(|(_, style)| style.fg == Some(Color::White))
-        );
-    }
-
-    #[test]
     fn markdown_highlights_do_not_cover_the_selection() {
         let range = ((0, 0), (0, 10));
         assert_eq!(
@@ -458,12 +320,6 @@ mod tests {
         );
         assert!(exclude_selection(range, Some(((0, 0), (0, 10)))).is_empty());
         assert_eq!(exclude_selection(range, None), vec![range]);
-    }
-
-    #[test]
-    fn rainbow_empty_selection_is_blank() {
-        let lines = ["hello".into()];
-        assert!(rainbow_selection(&lines, ((0, 2), (0, 2))).is_empty());
     }
 
     const CMD_LINE: &str =
@@ -479,13 +335,6 @@ mod tests {
             let ((sr, sb), (er, eb)) = range_to_bytes(&lines, range);
             assert!(lines[sr].is_char_boundary(sb), "start {sb} in {range:?}");
             assert!(lines[er].is_char_boundary(eb), "end {eb} in {range:?}");
-        }
-
-        let n = CMD_LINE.chars().count();
-        for (range, _) in rainbow_selection(&lines, ((0, 0), (0, n))) {
-            let ((sr, sb), (er, eb)) = range_to_bytes(&lines, range);
-            assert!(lines[sr].is_char_boundary(sb), "rainbow start {sb}");
-            assert!(lines[er].is_char_boundary(eb), "rainbow end {eb}");
         }
     }
 

@@ -3,7 +3,6 @@ mod backend;
 mod block;
 mod clipboard;
 mod format;
-mod frontmatter;
 mod heading;
 mod highlight;
 mod install;
@@ -24,6 +23,21 @@ use unpeel_app_kit::KeyboardEnhancementGuard;
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
+    match std::env::args_os().nth(1).as_deref() {
+        Some(argument) if argument == "--help" || argument == "-h" => {
+            println!("Usage: unpeel-markdown [FILE|FOLDER]");
+            return Ok(());
+        }
+        Some(argument) if argument == "--version" => {
+            println!("unpeel-markdown {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(argument) if argument == "--register" => {
+            install::ensure_installed();
+            return Ok(());
+        }
+        _ => {}
+    }
     install::ensure_installed();
     let mut status = unpeel::StatusReporter::detect();
     status.idle();

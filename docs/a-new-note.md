@@ -1,5 +1,1 @@
----
-cover: "#cccc"
-title: "A new note"
-description: ""
----
+# A new note

@@ -11,6 +11,7 @@ const APP_TOML: &str = r##"# Installed by unpeel-markdown; safe to delete (it re
 manifest_version = 1
 id = "unpeel.app.markdown"
 name = "Markdown"
+version = "@APP_VERSION@"
 command = "@LAUNCH_COMMAND@"
 description = "Terminal markdown editor with live block styling, headings picker, slash commands, and mouse support; open a file or a folder of notes"
 
@@ -104,7 +105,9 @@ pub fn ensure_installed() {
     let Some(home) = unpeel_home().filter(|home| home.is_dir()) else {
         return;
     };
-    let manifest = APP_TOML.replace("@LAUNCH_COMMAND@", &toml_escaped(&launch_command()));
+    let manifest = APP_TOML
+        .replace("@APP_VERSION@", env!("CARGO_PKG_VERSION"))
+        .replace("@LAUNCH_COMMAND@", &toml_escaped(&launch_command()));
     let dir = home.join("apps").join(APP_ID);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -133,6 +136,7 @@ mod tests {
         assert!(APP_TOML.contains("command_aliases = [\"unpeel-markdown\"]"));
         assert!(APP_TOML.contains("process_aliases = [\"unpeel-markdown\"]"));
         assert!(APP_TOML.contains("id = \"unpeel.app.markdown\""));
+        assert!(APP_TOML.contains("version = \"@APP_VERSION@\""));
     }
 
     #[test]
@@ -170,6 +174,7 @@ mod tests {
         let dir = home.join("apps").join(APP_ID);
         let manifest = std::fs::read_to_string(dir.join("app.toml")).unwrap();
         assert!(manifest.contains("command = \"unpeel-markdown\""));
+        assert!(manifest.contains(concat!("version = \"", env!("CARGO_PKG_VERSION"), "\"")));
         assert!(manifest.contains("command_aliases = [\"unpeel-markdown\"]"));
         assert!(manifest.contains("process_aliases = [\"unpeel-markdown\"]"));
         assert!(dir.join("skill.md").is_file());

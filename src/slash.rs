@@ -328,10 +328,7 @@ pub fn render_menu(
             if i == selected {
                 lines.push(Line::from(Span::styled(
                     text,
-                    Style::new()
-                        .fg(theme.selected_text)
-                        .bg(theme.selected)
-                        .bold(),
+                    theme.kit.selected_row.bold(),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(text, Style::new().fg(theme.muted))));
