@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
     DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput, ExplorerTheme,
+    display_path_from_root,
 };
 
 use crate::theme::Theme;
@@ -297,7 +298,7 @@ impl Picker {
                 || {
                     self.drags.register(footer, self.explorer.cwd());
                     (
-                        self.explorer.cwd().display().to_string(),
+                        display_path_from_root(self.explorer.cwd(), &self.root),
                         Style::new().fg(self.theme.muted),
                     )
                 },
@@ -625,14 +626,7 @@ mod tests {
         assert!((0..width).all(|column| buffer[(column, 1)].bg == selected_background));
         assert_ne!(buffer[(0, 0)].symbol(), "┌");
         assert_ne!(buffer[(width - 1, 4)].symbol(), "┘");
-        let root_prefix = picker
-            .root
-            .display()
-            .to_string()
-            .chars()
-            .take(20)
-            .collect::<String>();
-        assert!(row_text(5).contains(&root_prefix));
+        assert_eq!(row_text(5).trim(), ".");
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),

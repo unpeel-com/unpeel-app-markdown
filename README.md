@@ -40,7 +40,7 @@ in `src/unpeel.rs` and `src/install.rs`. Reusable UI comes from
 `../unpeel-app-kit`: shared dark/light colors, gray selection, keyboard mode,
 scrollbars, and the Ratatui `MarkdownTextArea` component.
 
-Install:
+## Install
 
 ```sh
 curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
@@ -48,6 +48,16 @@ curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
 
 The checksum-verified installer registers the versioned App manifest
 immediately under `~/.unpeel/apps/unpeel.app.markdown/`.
+
+To build and install from source, keep App Kit beside the App repository:
+
+```sh
+mkdir -p ~/Dev && cd ~/Dev
+git clone https://github.com/unpeel-com/unpeel-app-kit.git
+git clone https://github.com/unpeel-com/unpeel-app-markdown.git
+cargo install --locked --path unpeel-app-markdown
+unpeel-markdown --register
+```
 
 ## Development
 
