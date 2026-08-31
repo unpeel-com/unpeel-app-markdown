@@ -18,7 +18,7 @@ use app::App;
 use backend::BackendCapture;
 use picker::Picker;
 use theme::Theme;
-use unpeel_app_kit::{AppContext, AppReporter, KeyboardEnhancementGuard};
+use unpeel_app_kit::{AppContext, AppMetadata, AppReporter, KeyboardEnhancementGuard, UiBridge};
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -38,6 +38,15 @@ fn main() -> color_eyre::Result<()> {
     let explicit_path = std::env::args().nth(1).map(PathBuf::from);
     let app_context = AppContext::detect();
     let theme = Theme::detect();
+    let mut ui_revision = 0u64;
+    let mut ui_bridge = UiBridge::detect(
+        AppMetadata::new(
+            install::APP_ID,
+            "Unpeel Markdown",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .description("Standalone Ratatui Markdown editor with an optional native/web projection"),
+    )?;
     ratatui::run(|terminal| {
         let _keyboard = KeyboardEnhancementGuard::enter()?;
         let _capture = BackendCapture::enable(terminal)?;
@@ -69,8 +78,12 @@ fn main() -> color_eyre::Result<()> {
                 status.set_title(&display_name(&file));
                 status.set_status(&editing_status(&file));
                 status.flush();
-                App::open_with_autosave(file, theme, start::read_autosave(install::APP_ID))?
-                    .run(terminal, &mut status)?;
+                App::open_with_autosave(file, theme, start::read_autosave(install::APP_ID))?.run(
+                    terminal,
+                    &mut status,
+                    &mut ui_bridge,
+                    &mut ui_revision,
+                )?;
                 status.set_title(&vault_title);
                 status.set_status("browsing notes");
                 status.set_context(&browsing_context(&path));
@@ -81,8 +94,12 @@ fn main() -> color_eyre::Result<()> {
             status.set_title(&display_name(&path));
             status.set_status(&editing_status(&path));
             status.flush();
-            App::open_with_autosave(path, theme, start::read_autosave(install::APP_ID))?
-                .run(terminal, &mut status)
+            App::open_with_autosave(path, theme, start::read_autosave(install::APP_ID))?.run(
+                terminal,
+                &mut status,
+                &mut ui_bridge,
+                &mut ui_revision,
+            )
         }
     })?;
     Ok(())

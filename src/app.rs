@@ -13,8 +13,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unpeel_app_kit::{
-    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownTextArea,
-    MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu, ThemeMonitor,
+    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownEditorConfig,
+    MarkdownEditorEvent, MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem,
+    MenuTheme, PopupMenu, ThemeMonitor, UiBridge, UiBridgeEvent, UiEventOutcome, UiNode,
+    markdown_delta_operations,
 };
 
 use crate::block::{self, BlockKind, EnterAction};
@@ -27,6 +29,8 @@ use crate::slash::{self, ItemId, MenuHit, MenuOrigin};
 use crate::theme::Theme;
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
+const UI_VIEW_ID: &str = "main";
+const UI_EDITOR_ID: &str = "markdown-editor";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -79,6 +83,7 @@ pub struct App<'a> {
     status: Option<(String, Instant)>,
     drag: Option<DragState>,
     last_click: Option<(Instant, u16, u16, u8)>,
+    presentation: MarkdownPresentation,
 }
 
 impl App<'_> {
@@ -117,6 +122,7 @@ impl App<'_> {
             status: None,
             drag: None,
             last_click: None,
+            presentation: MarkdownPresentation::Source,
         };
         if is_new {
             app.flash(if autosave {
@@ -132,19 +138,119 @@ impl App<'_> {
         &mut self,
         terminal: &mut DefaultTerminal,
         status: &mut AppReporter,
+        bridge: &mut UiBridge,
+        revision_counter: &mut u64,
     ) -> io::Result<()> {
+        let mut revision = revision_counter
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+        let mut published = self.ui_node();
+        bridge
+            .publish(UI_VIEW_ID, revision, published.clone())
+            .map_err(ui_bridge_error)?;
         while !self.exit {
+            self.drain_bridge(bridge, &mut revision, &mut published)?;
             self.maybe_autosave();
-            self.drop_target.begin_frame();
-            terminal.draw(|frame| self.draw(frame))?;
-            self.drop_target.commit()?;
+            self.publish_projection(bridge, &mut revision, &mut published)?;
+            if bridge.should_render_terminal() {
+                self.drop_target.begin_frame();
+                terminal.draw(|frame| self.draw(frame))?;
+                self.drop_target.commit()?;
+            }
             self.publish_context(status);
             self.handle_events()?;
+            self.publish_projection(bridge, &mut revision, &mut published)?;
         }
         if self.autosave && self.dirty {
             self.write_document(false);
+            self.publish_projection(bridge, &mut revision, &mut published)?;
         }
+        *revision_counter = revision;
         status.flush();
+        Ok(())
+    }
+
+    fn editor_config(&self) -> MarkdownEditorConfig {
+        MarkdownEditorConfig::new(UI_EDITOR_ID)
+            .title(file_name(&self.path))
+            .dirty(self.dirty)
+            .presentation(self.presentation)
+    }
+
+    fn ui_node(&self) -> UiNode {
+        self.textarea.ui_node(&self.editor_config())
+    }
+
+    fn publish_projection(
+        &self,
+        bridge: &mut UiBridge,
+        revision: &mut u64,
+        published: &mut UiNode,
+    ) -> io::Result<()> {
+        let next = self.ui_node();
+        let operations = markdown_delta_operations(published, &next);
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+        bridge
+            .publish_delta(UI_VIEW_ID, *revision, next_revision, operations)
+            .map_err(ui_bridge_error)?;
+        *revision = next_revision;
+        *published = next;
+        Ok(())
+    }
+
+    fn drain_bridge(
+        &mut self,
+        bridge: &mut UiBridge,
+        revision: &mut u64,
+        published: &mut UiNode,
+    ) -> io::Result<()> {
+        while let Some(message) = bridge.poll().map_err(ui_bridge_error)? {
+            match message {
+                UiBridgeEvent::Action { event, .. } => {
+                    let result =
+                        self.textarea
+                            .handle_ui_event(*revision, &self.editor_config(), &event);
+                    let outcome = match result {
+                        Ok(Some(MarkdownEditorEvent::TextChanged { changed: true }))
+                        | Ok(Some(MarkdownEditorEvent::Undo { changed: true }))
+                        | Ok(Some(MarkdownEditorEvent::Redo { changed: true })) => {
+                            self.after_edit();
+                            UiEventOutcome::Applied
+                        }
+                        Ok(Some(MarkdownEditorEvent::PresentationRequested(presentation))) => {
+                            self.presentation = presentation;
+                            UiEventOutcome::Applied
+                        }
+                        Ok(Some(MarkdownEditorEvent::SaveRequested)) => {
+                            self.save();
+                            UiEventOutcome::Applied
+                        }
+                        Ok(Some(MarkdownEditorEvent::SelectionChanged))
+                        | Ok(Some(MarkdownEditorEvent::TextChanged { changed: false }))
+                        | Ok(Some(MarkdownEditorEvent::Undo { changed: false }))
+                        | Ok(Some(MarkdownEditorEvent::Redo { changed: false })) => {
+                            UiEventOutcome::Applied
+                        }
+                        Ok(None) => UiEventOutcome::Rejected(
+                            "Action targets a different Markdown component".to_string(),
+                        ),
+                        Err(error) => UiEventOutcome::Rejected(error.to_string()),
+                    };
+                    self.publish_projection(bridge, revision, published)?;
+                    bridge
+                        .acknowledge(&event, outcome, *revision)
+                        .map_err(ui_bridge_error)?;
+                }
+                UiBridgeEvent::Attached { .. }
+                | UiBridgeEvent::Detached { .. }
+                | UiBridgeEvent::Lifecycle { .. } => {}
+            }
+        }
         Ok(())
     }
 
@@ -1313,6 +1419,10 @@ impl App<'_> {
     }
 }
 
+fn ui_bridge_error(error: unpeel_app_kit::UiBridgeError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 fn editor_context_menu(
     reference: String,
     can_send: bool,
@@ -1532,6 +1642,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn multiline_terminal_selection_projects_as_utf16_for_native_renderers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("selection-sync.md");
+        std::fs::write(&path, "alpha\n🙂 beta\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.set_selection((0, 1), (1, 2));
+
+        let node = app.ui_node();
+        let unpeel_app_kit::UiComponent::MarkdownEditor(editor) = node.element else {
+            panic!("Markdown App must publish the MarkdownEditor component");
+        };
+        assert_eq!(
+            editor.selection.anchor,
+            unpeel_app_kit::TextPosition::new(0, 1)
+        );
+        assert_eq!(
+            editor.selection.head,
+            unpeel_app_kit::TextPosition::new(1, 3),
+            "emoji occupies two UTF-16 code units"
+        );
     }
 
     #[test]

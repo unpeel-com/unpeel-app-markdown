@@ -42,10 +42,29 @@ the `unpeel-markdown` CLI directly from `PATH`: the session row takes the
 App's name and live project/workspace accent, and the sidebar shows which note
 you're editing. No App registry write is required.
 
-The Unpeel integration remains the documented plain-file plus local HTTP
-contract, implemented once by `unpeel-app-kit`'s `AppReporter`. Reusable UI
-also comes from App Kit: live dark/light/accent colors, gray selection,
-keyboard mode, scrollbars, native drop destinations, and `MarkdownTextArea`.
+The same binary also exposes App Kit's optional `MarkdownEditor` projection
+when its Host injects a UI endpoint. Ratatui, SwiftUI/AppKit, and web renderers
+then edit the same authoritative document: Unicode-safe text deltas and
+oriented selection deltas keep the caret and multi-line selection synchronized
+without replacing the full document on each keystroke. Terminal drag and
+Shift-selection, double-click word selection, and triple-click line selection
+all enter that same revision stream. A renderer with an `edit` grant—including
+an attached agent—uses the same semantic actions and acknowledgements.
+
+The `/` insert picker remains a closed Markdown menu rather than a generic
+widget tree. In the TUI it is a compact, caret-anchored bordered dropdown with
+a full-width gray selection. In the native editor it stays left-aligned and
+supports Up/Down, Home/End, Return/Tab, and Escape without stealing focus from
+the document. Auto-save and the file itself remain authoritative, so renderer
+disconnects, native-view restarts, and terminal visibility changes do not lose
+the document.
+
+Status integration remains the documented plain-file plus local HTTP contract,
+implemented once by `unpeel-app-kit`'s `AppReporter`. The optional semantic UI
+uses App Kit's local, scoped UI bridge and stays inert when no endpoint is
+injected. Reusable UI also comes from App Kit: live dark/light/accent colors,
+gray selection, keyboard mode, scrollbars, native drop destinations,
+`MarkdownTextArea`, and `MarkdownEditorInteraction`.
 
 ## Install
 
