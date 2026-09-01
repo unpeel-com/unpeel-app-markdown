@@ -130,18 +130,6 @@ impl Picker {
     fn on_key(&mut self, key: KeyEvent) -> Option<Choice> {
         self.clicks.reset();
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alternate = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let command = key
-            .modifiers
-            .intersects(KeyModifiers::SUPER | KeyModifiers::META);
-        let non_text_modifier = key.modifiers.intersects(
-            KeyModifiers::CONTROL
-                | KeyModifiers::ALT
-                | KeyModifiers::SUPER
-                | KeyModifiers::HYPER
-                | KeyModifiers::META,
-        );
         if key.code == KeyCode::Char('c') && control {
             return Some(Choice::Quit);
         }
@@ -149,79 +137,20 @@ impl Picker {
             if self.explorer.cwd() == self.root {
                 return Some(Choice::Quit);
             }
-            return self.apply_explorer(ExplorerInput::Parent);
-        }
-        if key.code == KeyCode::Enter {
-            return self.apply_explorer(ExplorerInput::Open);
+            let input = self.explorer.input_for_key(&key)?;
+            return self.apply_explorer(input);
         }
         if key.code == KeyCode::Char('n') && control {
             return Some(Choice::Create(self.explorer.cwd().to_path_buf()));
         }
-        if self.explorer.filter_focused() {
-            return match key.code {
-                KeyCode::Tab | KeyCode::Down => self.apply_explorer(ExplorerInput::BlurFilter),
-                KeyCode::Up => self.apply_explorer(ExplorerInput::Up),
-                KeyCode::Char('p') if control => self.apply_explorer(ExplorerInput::Up),
-                KeyCode::PageUp => self.apply_explorer(ExplorerInput::PageUp),
-                KeyCode::PageDown => self.apply_explorer(ExplorerInput::PageDown),
-                KeyCode::Left if command => {
-                    self.apply_explorer(ExplorerInput::FilterHome { extend: shift })
-                }
-                KeyCode::Right if command => {
-                    self.apply_explorer(ExplorerInput::FilterEnd { extend: shift })
-                }
-                KeyCode::Left => self.apply_explorer(ExplorerInput::FilterLeft {
-                    extend: shift,
-                    word: control || alternate,
-                }),
-                KeyCode::Right => self.apply_explorer(ExplorerInput::FilterRight {
-                    extend: shift,
-                    word: control || alternate,
-                }),
-                KeyCode::Home => self.apply_explorer(ExplorerInput::FilterHome { extend: shift }),
-                KeyCode::End => self.apply_explorer(ExplorerInput::FilterEnd { extend: shift }),
-                KeyCode::Backspace => self.apply_explorer(ExplorerInput::FilterBackspace),
-                KeyCode::Delete => self.apply_explorer(ExplorerInput::FilterDelete),
-                KeyCode::Char('a') if control || command => {
-                    self.apply_explorer(ExplorerInput::FilterSelectAll)
-                }
-                KeyCode::Char('u') if control => self.apply_explorer(ExplorerInput::ClearFilter),
-                KeyCode::Char('r') if control => self.apply_explorer(ExplorerInput::Refresh),
-                KeyCode::Char(character) if !non_text_modifier => {
-                    self.apply_explorer(ExplorerInput::FilterCharacter(character))
-                }
-                _ => None,
-            };
+        if key.code == KeyCode::Char('p') && control {
+            return self.apply_explorer(ExplorerInput::Up);
         }
-        match key.code {
-            KeyCode::Tab | KeyCode::Char('/') => {
-                return self.apply_explorer(ExplorerInput::FocusFilter);
-            }
-            KeyCode::Up if self.explorer.selected_index() == 0 => {
-                return self.apply_explorer(ExplorerInput::FocusFilter);
-            }
-            KeyCode::Up => return self.apply_explorer(ExplorerInput::Up),
-            KeyCode::Char('p') if control => {
-                return self.apply_explorer(ExplorerInput::Up);
-            }
-            KeyCode::Down => return self.apply_explorer(ExplorerInput::Down),
-            KeyCode::PageUp => return self.apply_explorer(ExplorerInput::PageUp),
-            KeyCode::PageDown => return self.apply_explorer(ExplorerInput::PageDown),
-            KeyCode::Home => return self.apply_explorer(ExplorerInput::First),
-            KeyCode::End => return self.apply_explorer(ExplorerInput::Last),
-            KeyCode::Left | KeyCode::Backspace => {
-                return self.apply_explorer(ExplorerInput::Parent);
-            }
-            KeyCode::Right => return self.apply_explorer(ExplorerInput::Open),
-            KeyCode::Char('r') if control => {
-                return self.apply_explorer(ExplorerInput::Refresh);
-            }
-            KeyCode::Char(character) if !non_text_modifier => {
-                return self.apply_explorer(ExplorerInput::FilterCharacter(character));
-            }
-            _ => {}
+        if key.code == KeyCode::Char('r') && control {
+            return self.apply_explorer(ExplorerInput::Refresh);
         }
-        None
+        let input = self.explorer.input_for_key(&key)?;
+        self.apply_explorer(input)
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Choice> {
