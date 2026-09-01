@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,9 +14,11 @@ use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unpeel_app_kit::{
-    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownEditorConfig,
-    MarkdownEditorEvent, MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem,
-    MenuTheme, PopupMenu, ThemeMonitor, UiBridge, UiBridgeEvent, UiEventOutcome, UiNode,
+    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownEditorActions,
+    MarkdownEditorConfig, MarkdownEditorEvent, MarkdownMenuTrigger, MarkdownPresentation,
+    MarkdownTextArea, MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu, SemanticMenu,
+    SemanticMenuAnchor, SemanticMenuItem, SemanticMenuPresentation, ThemeMonitor, UiBridge,
+    UiBridgeEvent, UiComponent, UiEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
     markdown_delta_operations,
 };
 
@@ -31,6 +34,12 @@ use crate::theme::Theme;
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
 const UI_VIEW_ID: &str = "main";
 const UI_EDITOR_ID: &str = "markdown-editor";
+const UI_MENU_SELECT: &str = "markdown-menu-select";
+const UI_MENU_DISMISS: &str = "markdown-menu-dismiss";
+const UI_CONTEXT_SEND: &str = "send-reference-to-agent";
+const UI_CONTEXT_COPY: &str = "copy-reference";
+const UI_CONTEXT_SEND_ID: &str = "context-send-agent";
+const UI_CONTEXT_COPY_ID: &str = "context-copy-reference";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -50,7 +59,34 @@ enum ContextAction {
     CopyReference(String),
 }
 
-type ContextMenu = PopupMenu<ContextAction>;
+struct ContextMenu {
+    popup: PopupMenu<String>,
+    reference: String,
+}
+
+impl ContextMenu {
+    fn selected_action(&self) -> Option<ContextAction> {
+        match self.popup.selected_value().map(String::as_str)? {
+            UI_CONTEXT_SEND_ID => Some(ContextAction::SendToAgent(self.reference.clone())),
+            UI_CONTEXT_COPY_ID => Some(ContextAction::CopyReference(self.reference.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl Deref for ContextMenu {
+    type Target = PopupMenu<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.popup
+    }
+}
+
+impl DerefMut for ContextMenu {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.popup
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragKind {
@@ -175,10 +211,110 @@ impl App<'_> {
             .title(file_name(&self.path))
             .dirty(self.dirty)
             .presentation(self.presentation)
+            .open_menu_action(MarkdownEditorActions::OPEN_MENU)
     }
 
     fn ui_node(&self) -> UiNode {
-        self.textarea.ui_node(&self.editor_config())
+        let mut node = self.textarea.ui_node(&self.editor_config());
+        let UiComponent::MarkdownEditor(editor) = &mut node.element else {
+            unreachable!("MarkdownTextArea always projects MarkdownEditor")
+        };
+        editor.insert_menu = self.semantic_insert_menu();
+        editor.context_menu = Some(self.semantic_context_menu());
+        node
+    }
+
+    fn semantic_insert_menu(&self) -> Option<SemanticMenu> {
+        let state = self.menu.as_ref()?;
+        let visible = self.visible_menu_items();
+        let selected = visible.get(state.selected).copied();
+        let mut menu = SemanticMenu::new(
+            match state.origin {
+                MenuOrigin::Slash => "Insert block",
+                MenuOrigin::Palette => "Block commands",
+            },
+            visible.iter().map(|item| {
+                SemanticMenuItem::new(menu_item_wire_id(item.id), item.name, UI_MENU_SELECT)
+                    .hint(format!("{}  {}", item.shortcut, item.sample))
+            }),
+        )
+        .anchor(SemanticMenuAnchor::Caret)
+        .presentation(SemanticMenuPresentation::Popup)
+        .dismiss_action(UI_MENU_DISMISS);
+        if let Some(selected) = selected {
+            menu = menu.selected_id(menu_item_wire_id(selected.id));
+        }
+        Some(menu)
+    }
+
+    fn semantic_context_menu(&self) -> SemanticMenu {
+        semantic_context_menu(self.agent.label().is_some())
+    }
+
+    fn current_reference(&self) -> String {
+        let rows = heading::selected_rows(
+            self.textarea.cursor(),
+            normalized_selection(self.textarea.selection_range()),
+            self.textarea.lines().len(),
+        );
+        line_reference(&self.path, rows)
+    }
+
+    fn handle_menu_ui_event(&mut self, revision: u64, event: &UiEvent) -> Result<bool, String> {
+        if event.base_revision != revision {
+            return Err(format!(
+                "Markdown changed from revision {} to {revision}; retry the menu action",
+                event.base_revision
+            ));
+        }
+        let node = event.action.node_id.as_str();
+        let action = event.action.action.as_str();
+        if action == UI_MENU_SELECT {
+            if event.action.kind != UiEventKind::Activate
+                || event.action.value != UiEventValue::None
+            {
+                return Err("Menu selection requires an activate event".to_string());
+            }
+            let Some(index) = self
+                .visible_menu_items()
+                .iter()
+                .position(|item| menu_item_wire_id(item.id) == node)
+            else {
+                return Err("Menu item is no longer visible".to_string());
+            };
+            self.apply_menu_index(index);
+            return Ok(true);
+        }
+        if node == UI_EDITOR_ID && action == UI_MENU_DISMISS {
+            if event.action.kind != UiEventKind::Cancel {
+                return Err("Menu dismissal requires a cancel event".to_string());
+            }
+            let revert_slash = self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.origin == MenuOrigin::Slash);
+            self.close_menu(revert_slash);
+            return Ok(true);
+        }
+        let context_action = match (node, action) {
+            (UI_CONTEXT_SEND_ID, UI_CONTEXT_SEND) => {
+                Some(ContextAction::SendToAgent(self.current_reference()))
+            }
+            (UI_CONTEXT_COPY_ID, UI_CONTEXT_COPY) => {
+                Some(ContextAction::CopyReference(self.current_reference()))
+            }
+            _ => None,
+        };
+        if let Some(context_action) = context_action {
+            if event.action.kind != UiEventKind::Activate
+                || event.action.value != UiEventValue::None
+            {
+                return Err("Context Menu selection requires an activate event".to_string());
+            }
+            self.activate_context_action(context_action);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn publish_projection(
@@ -212,34 +348,68 @@ impl App<'_> {
         while let Some(message) = bridge.poll().map_err(ui_bridge_error)? {
             match message {
                 UiBridgeEvent::Action { event, .. } => {
-                    let result =
-                        self.textarea
-                            .handle_ui_event(*revision, &self.editor_config(), &event);
+                    let menu_result = self.handle_menu_ui_event(*revision, &event);
+                    let result = match menu_result {
+                        Ok(true) => None,
+                        Ok(false) => Some(self.textarea.handle_ui_event(
+                            *revision,
+                            &self.editor_config(),
+                            &event,
+                        )),
+                        Err(error) => {
+                            self.publish_projection(bridge, revision, published)?;
+                            bridge
+                                .acknowledge(&event, UiEventOutcome::Rejected(error), *revision)
+                                .map_err(ui_bridge_error)?;
+                            continue;
+                        }
+                    };
                     let outcome = match result {
-                        Ok(Some(MarkdownEditorEvent::TextChanged { changed: true }))
-                        | Ok(Some(MarkdownEditorEvent::Undo { changed: true }))
-                        | Ok(Some(MarkdownEditorEvent::Redo { changed: true })) => {
+                        None => UiEventOutcome::Applied,
+                        Some(Ok(Some(MarkdownEditorEvent::TextChanged { changed: true })))
+                        | Some(Ok(Some(MarkdownEditorEvent::Undo { changed: true })))
+                        | Some(Ok(Some(MarkdownEditorEvent::Redo { changed: true }))) => {
                             self.after_edit();
+                            self.sync_external_slash_menu();
                             UiEventOutcome::Applied
                         }
-                        Ok(Some(MarkdownEditorEvent::PresentationRequested(presentation))) => {
+                        Some(Ok(Some(MarkdownEditorEvent::PresentationRequested(
+                            presentation,
+                        )))) => {
                             self.presentation = presentation;
                             UiEventOutcome::Applied
                         }
-                        Ok(Some(MarkdownEditorEvent::SaveRequested)) => {
+                        Some(Ok(Some(MarkdownEditorEvent::MenuRequested(trigger)))) => {
+                            if !self.can_open_slash() {
+                                UiEventOutcome::Rejected(
+                                    "Block menus open only on a blank line outside code fences"
+                                        .to_string(),
+                                )
+                            } else {
+                                if trigger == MarkdownMenuTrigger::Slash {
+                                    self.textarea.insert_char('/');
+                                    self.after_edit();
+                                    self.open_menu(MenuOrigin::Slash);
+                                } else {
+                                    self.open_menu(MenuOrigin::Palette);
+                                }
+                                UiEventOutcome::Applied
+                            }
+                        }
+                        Some(Ok(Some(MarkdownEditorEvent::SaveRequested))) => {
                             self.save();
                             UiEventOutcome::Applied
                         }
-                        Ok(Some(MarkdownEditorEvent::SelectionChanged))
-                        | Ok(Some(MarkdownEditorEvent::TextChanged { changed: false }))
-                        | Ok(Some(MarkdownEditorEvent::Undo { changed: false }))
-                        | Ok(Some(MarkdownEditorEvent::Redo { changed: false })) => {
+                        Some(Ok(Some(MarkdownEditorEvent::SelectionChanged)))
+                        | Some(Ok(Some(MarkdownEditorEvent::TextChanged { changed: false })))
+                        | Some(Ok(Some(MarkdownEditorEvent::Undo { changed: false })))
+                        | Some(Ok(Some(MarkdownEditorEvent::Redo { changed: false }))) => {
                             UiEventOutcome::Applied
                         }
-                        Ok(None) => UiEventOutcome::Rejected(
+                        Some(Ok(None)) => UiEventOutcome::Rejected(
                             "Action targets a different Markdown component".to_string(),
                         ),
-                        Err(error) => UiEventOutcome::Rejected(error.to_string()),
+                        Some(Err(error)) => UiEventOutcome::Rejected(error.to_string()),
                     };
                     self.publish_projection(bridge, revision, published)?;
                     bridge
@@ -591,9 +761,13 @@ impl App<'_> {
         let Some(menu) = self.context_menu.take() else {
             return;
         };
-        let Some(action) = menu.selected_value().cloned() else {
+        let Some(action) = menu.selected_action() else {
             return;
         };
+        self.activate_context_action(action);
+    }
+
+    fn activate_context_action(&mut self, action: ContextAction) {
         match action {
             ContextAction::SendToAgent(reference) => match self.agent.send_reference(&reference) {
                 Ok(label) => self.flash(format!("Sent reference to {label}")),
@@ -1177,6 +1351,17 @@ impl App<'_> {
         }
     }
 
+    fn sync_external_slash_menu(&mut self) {
+        if self.menu.is_none()
+            && !self.textarea.is_selecting()
+            && !self.in_fence()
+            && self.current_slash_query().is_some()
+        {
+            self.open_menu(MenuOrigin::Slash);
+        }
+        self.sync_slash_menu();
+    }
+
     fn apply_menu_index(&mut self, index: usize) {
         let Some(item) = self.visible_menu_items().get(index).copied() else {
             return;
@@ -1429,18 +1614,51 @@ fn editor_context_menu(
     anchor: Position,
     theme: Theme,
 ) -> ContextMenu {
+    let semantic = semantic_context_menu(can_send);
+    ContextMenu {
+        popup: semantic.popup(anchor, MenuTheme::for_color_scheme(theme.kit.scheme)),
+        reference,
+    }
+}
+
+fn semantic_context_menu(can_send: bool) -> SemanticMenu {
     let mut items = Vec::with_capacity(2);
     if can_send {
-        items.push(MenuItem::new(
+        items.push(SemanticMenuItem::new(
+            UI_CONTEXT_SEND_ID,
             "Send to agent",
-            ContextAction::SendToAgent(reference.clone()),
+            UI_CONTEXT_SEND,
         ));
     }
-    items.push(MenuItem::new(
+    items.push(SemanticMenuItem::new(
+        UI_CONTEXT_COPY_ID,
         "Copy reference",
-        ContextAction::CopyReference(reference),
+        UI_CONTEXT_COPY,
     ));
-    PopupMenu::new(anchor, items).with_theme(MenuTheme::for_color_scheme(theme.kit.scheme))
+    SemanticMenu::new("Selection actions", items)
+        .presentation(SemanticMenuPresentation::Context)
+        .anchor(SemanticMenuAnchor::Pointer)
+}
+
+fn menu_item_wire_id(item: ItemId) -> &'static str {
+    match item {
+        ItemId::Block(BlockKind::Heading(1)) => "block-heading-1",
+        ItemId::Block(BlockKind::Heading(2)) => "block-heading-2",
+        ItemId::Block(BlockKind::Heading(3)) => "block-heading-3",
+        ItemId::Block(BlockKind::Heading(4)) => "block-heading-4",
+        ItemId::Block(BlockKind::Heading(5)) => "block-heading-5",
+        ItemId::Block(BlockKind::Heading(6)) => "block-heading-6",
+        ItemId::Block(BlockKind::Heading(_)) => "block-heading",
+        ItemId::Block(BlockKind::Paragraph) => "block-paragraph",
+        ItemId::Block(BlockKind::Bullet) => "block-bullet-list",
+        ItemId::Block(BlockKind::Numbered) => "block-numbered-list",
+        ItemId::Block(BlockKind::Todo) => "block-todo",
+        ItemId::Block(BlockKind::Quote) => "block-quote",
+        ItemId::Block(BlockKind::Code) => "block-code",
+        ItemId::Block(BlockKind::Divider) => "block-divider",
+        ItemId::LiteralBackslash => "insert-backslash",
+        ItemId::ToggleAutosave => "toggle-autosave",
+    }
 }
 
 fn normalized_selection(
@@ -1668,6 +1886,59 @@ mod tests {
     }
 
     #[test]
+    fn slash_palette_and_context_publish_the_tui_menu_reducer_semantically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("menus.md");
+        std::fs::write(&path, "").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.textarea.insert_char('/');
+        app.open_menu(MenuOrigin::Slash);
+        app.set_menu_selected(2);
+        let visible = app.visible_menu_items();
+        let expected_ids = visible
+            .iter()
+            .map(|item| menu_item_wire_id(item.id))
+            .collect::<Vec<_>>();
+
+        let node = app.ui_node();
+        let UiComponent::MarkdownEditor(editor) = node.element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        assert_eq!(
+            editor
+                .actions
+                .open_menu
+                .as_ref()
+                .map(|action| action.as_str()),
+            Some(MarkdownEditorActions::OPEN_MENU)
+        );
+        let menu = editor.insert_menu.expect("slash menu projection");
+        assert_eq!(
+            menu.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(menu.selected_id.as_deref(), Some(expected_ids[2]));
+        assert!(menu.items[0].hint.as_deref().unwrap().contains('#'));
+        assert_eq!(
+            editor.context_menu.unwrap().presentation,
+            SemanticMenuPresentation::Context
+        );
+
+        app.close_menu(true);
+        app.open_menu(MenuOrigin::Palette);
+        let node = app.ui_node();
+        let UiComponent::MarkdownEditor(editor) = node.element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        let palette = editor.insert_menu.expect("palette projection");
+        assert!(palette.item("insert-backslash").is_some());
+        assert!(palette.item("toggle-autosave").is_some());
+    }
+
+    #[test]
     fn yaml_frontmatter_is_ordinary_editable_markdown() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("note.md");
@@ -1792,8 +2063,8 @@ mod tests {
         assert_eq!(with_agent.items().len(), 2);
         assert_eq!(with_agent.items()[0].label(), "Send to agent");
         assert_eq!(
-            with_agent.items()[0].value(),
-            &ContextAction::SendToAgent(reference.clone())
+            with_agent.selected_action(),
+            Some(ContextAction::SendToAgent(reference.clone()))
         );
         assert_eq!(with_agent.items()[1].label(), "Copy reference");
 
@@ -1801,8 +2072,8 @@ mod tests {
         assert_eq!(without_agent.items().len(), 1);
         assert_eq!(without_agent.items()[0].label(), "Copy reference");
         assert_eq!(
-            without_agent.items()[0].value(),
-            &ContextAction::CopyReference(reference)
+            without_agent.selected_action(),
+            Some(ContextAction::CopyReference(reference))
         );
     }
 

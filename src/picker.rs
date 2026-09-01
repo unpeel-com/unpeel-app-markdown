@@ -16,11 +16,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
-    DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput, ExplorerTheme,
-    ThemeMonitor, display_path_from_root,
+    Button, ButtonRole, DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput,
+    ExplorerTheme, Input, List, Page, ThemeMonitor, UiBridge, UiBridgeEvent, UiEvent, UiEventKind,
+    UiEventOutcome, UiEventValue, UiNode, display_path_from_root, tree_delta_operations,
 };
 
 use crate::theme::Theme;
+
+const UI_VIEW_ID: &str = "main";
+const UI_TREE_ID: &str = "notes-tree";
+const UI_NEW_NOTE_ID: &str = "new-note";
+const UI_NEW_NOTE_ACTION: &str = "new-note";
+const UI_NEW_NOTE_INPUT_ID: &str = "new-note-name";
+const UI_NEW_NOTE_SET_VALUE: &str = "set-new-note-name";
+const UI_NEW_NOTE_SUBMIT: &str = "create-new-note";
+const UI_NEW_NOTE_CANCEL: &str = "cancel-new-note";
 
 pub struct Picker {
     root: PathBuf,
@@ -29,6 +39,7 @@ pub struct Picker {
     drags: DragSurface,
     clicks: DoubleClickTracker<PathBuf>,
     status: Option<String>,
+    create: Option<CreateState>,
     theme: Theme,
     theme_monitor: ThemeMonitor,
 }
@@ -51,20 +62,44 @@ impl Picker {
             drags: DragSurface::detect(),
             clicks: DoubleClickTracker::new(),
             status: None,
+            create: None,
             theme,
             theme_monitor: ThemeMonitor::from_theme(theme.kit),
         })
     }
 
     /// Runs the picker until the user chooses a file (`Some`) or quits (`None`).
-    pub fn pick(&mut self, terminal: &mut DefaultTerminal) -> io::Result<Option<PathBuf>> {
+    pub fn pick(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        bridge: &mut UiBridge,
+        revision_counter: &mut u64,
+    ) -> io::Result<Option<PathBuf>> {
         self.rescan()?;
+        let mut revision = revision_counter
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+        let mut published = self.ui_node();
+        bridge
+            .publish(UI_VIEW_ID, revision, published.clone())
+            .map_err(ui_bridge_error)?;
         loop {
-            self.drags.begin_frame();
-            terminal.draw(|frame| self.draw(frame))?;
-            self.drags.commit()?;
+            if let Some(result) = self.drain_bridge(bridge, &mut revision, &mut published)? {
+                *revision_counter = revision;
+                return Ok(result);
+            }
+            self.publish_projection(bridge, &mut revision, &mut published)?;
+            if bridge.should_render_terminal() {
+                self.drags.begin_frame();
+                terminal.draw(|frame| self.draw(frame))?;
+                self.drags.commit()?;
+            }
             while !event::poll(Duration::from_millis(250))? {
                 self.drags.heartbeat()?;
+                if let Some(result) = self.drain_bridge(bridge, &mut revision, &mut published)? {
+                    *revision_counter = revision;
+                    return Ok(result);
+                }
                 if self.theme_monitor.refresh() {
                     self.theme = Theme::from_kit(self.theme_monitor.theme());
                     self.explorer
@@ -75,44 +110,40 @@ impl Picker {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    if let Some(choice) = self.on_key(key) {
-                        match choice {
-                            Choice::Open(path) => return Ok(Some(path)),
-                            Choice::Create(folder) => {
-                                self.clear_drag_map()?;
-                                if let Some(path) = prompt_new_note(terminal, &folder, self.theme)?
-                                {
-                                    return Ok(Some(path));
-                                }
-                                self.rescan()?;
-                            }
-                            Choice::Quit => return Ok(None),
-                        }
+                    let choice = if self.create.is_some() {
+                        self.on_create_key(key)
+                    } else {
+                        self.on_key(key)
+                    };
+                    if let Some(choice) = choice
+                        && let Some(result) = self.apply_choice(choice)?
+                    {
+                        self.publish_projection(bridge, &mut revision, &mut published)?;
+                        *revision_counter = revision;
+                        return Ok(result);
                     }
                 }
-                Event::Mouse(mouse) => {
+                Event::Mouse(mouse) if self.create.is_none() => {
                     if let Some(choice) = self.on_mouse(mouse) {
-                        match choice {
-                            Choice::Open(path) => return Ok(Some(path)),
-                            Choice::Create(folder) => {
-                                self.clear_drag_map()?;
-                                if let Some(path) = prompt_new_note(terminal, &folder, self.theme)?
-                                {
-                                    return Ok(Some(path));
-                                }
-                                self.rescan()?;
-                            }
-                            Choice::Quit => return Ok(None),
+                        if let Some(result) = self.apply_choice(choice)? {
+                            self.publish_projection(bridge, &mut revision, &mut published)?;
+                            *revision_counter = revision;
+                            return Ok(result);
                         }
                     }
                 }
                 Event::Paste(text) => {
                     self.clicks.reset();
-                    self.explorer.insert_filter_text(text);
-                    self.status = None;
+                    if let Some(create) = self.create.as_mut() {
+                        create.insert(&text);
+                    } else {
+                        self.explorer.insert_filter_text(text);
+                        self.status = None;
+                    }
                 }
                 _ => {}
             }
+            self.publish_projection(bridge, &mut revision, &mut published)?;
         }
     }
 
@@ -125,6 +156,211 @@ impl Picker {
     fn clear_drag_map(&mut self) -> io::Result<()> {
         self.drags.begin_frame();
         self.drags.commit()
+    }
+
+    fn apply_choice(&mut self, choice: Choice) -> io::Result<Option<Option<PathBuf>>> {
+        match choice {
+            Choice::Open(path) => Ok(Some(Some(path))),
+            Choice::Create(folder) => {
+                self.clear_drag_map()?;
+                self.create = Some(CreateState::new(folder));
+                Ok(None)
+            }
+            Choice::Update => Ok(None),
+            Choice::Quit => Ok(Some(None)),
+        }
+    }
+
+    fn on_create_key(&mut self, key: KeyEvent) -> Option<Choice> {
+        let create = self.create.as_mut()?;
+        match key.code {
+            KeyCode::Esc => {
+                self.create = None;
+                None
+            }
+            KeyCode::Enter => {
+                let folder = create.folder.clone();
+                let name = create.name.clone();
+                match create_note(&folder, &name) {
+                    Ok(path) => Some(Choice::Open(path)),
+                    Err(message) => {
+                        create.error = Some(message);
+                        None
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                create.name.pop();
+                create.error = None;
+                None
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                create.name.clear();
+                create.error = None;
+                None
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                    && create.name.chars().count() < 120 =>
+            {
+                create.name.push(character);
+                create.error = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn ui_node(&mut self) -> UiNode {
+        if let Some(create) = &self.create {
+            let message = create.error.clone().unwrap_or_else(|| {
+                note_stem(&create.name)
+                    .map(|stem| format!("Creates {stem}.md"))
+                    .unwrap_or_else(|_| "Creates a Markdown file in this folder".to_string())
+            });
+            let page = Page::new(
+                "New note",
+                List::new("new-note-details", Vec::new()).empty_message(message),
+            )
+            .input(
+                Input::new(UI_NEW_NOTE_INPUT_ID, "Name")
+                    .value(create.name.clone())
+                    .placeholder("Note name")
+                    .set_value_action(UI_NEW_NOTE_SET_VALUE)
+                    .submit_action(UI_NEW_NOTE_SUBMIT),
+            )
+            .back_action(UI_NEW_NOTE_CANCEL);
+            return UiNode::page(UI_TREE_ID, page);
+        }
+        let tree = self.explorer.semantic_tree("Notes").primary_action(
+            Button::new(UI_NEW_NOTE_ID, "New Markdown file", UI_NEW_NOTE_ACTION)
+                .role(ButtonRole::Primary),
+        );
+        UiNode::tree(UI_TREE_ID, tree)
+    }
+
+    fn publish_projection(
+        &mut self,
+        bridge: &mut UiBridge,
+        revision: &mut u64,
+        published: &mut UiNode,
+    ) -> io::Result<()> {
+        let next = self.ui_node();
+        if next == *published {
+            return Ok(());
+        }
+        let operations = tree_delta_operations(published, &next);
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+        bridge
+            .publish_delta(UI_VIEW_ID, *revision, next_revision, operations)
+            .map_err(ui_bridge_error)?;
+        *revision = next_revision;
+        *published = next;
+        Ok(())
+    }
+
+    fn drain_bridge(
+        &mut self,
+        bridge: &mut UiBridge,
+        revision: &mut u64,
+        published: &mut UiNode,
+    ) -> io::Result<Option<Option<PathBuf>>> {
+        while let Some(message) = bridge.poll().map_err(ui_bridge_error)? {
+            let UiBridgeEvent::Action { event, .. } = message else {
+                continue;
+            };
+            let decision = self.handle_ui_event(*revision, &event);
+            let (outcome, result) = match decision {
+                Ok(Some(choice)) => match self.apply_choice(choice) {
+                    Ok(result) => (UiEventOutcome::Applied, result),
+                    Err(error) => (UiEventOutcome::Rejected(error.to_string()), None),
+                },
+                Ok(None) => (
+                    UiEventOutcome::Rejected(
+                        "Action targets a different picker component".to_string(),
+                    ),
+                    None,
+                ),
+                Err(message) => (UiEventOutcome::Rejected(message), None),
+            };
+            self.publish_projection(bridge, revision, published)?;
+            bridge
+                .acknowledge(&event, outcome, *revision)
+                .map_err(ui_bridge_error)?;
+            if result.is_some() {
+                return Ok(result);
+            }
+        }
+        Ok(None)
+    }
+
+    fn handle_ui_event(
+        &mut self,
+        revision: u64,
+        event: &UiEvent,
+    ) -> Result<Option<Choice>, String> {
+        if event.base_revision != revision {
+            return Err(format!(
+                "Picker changed from revision {} to {revision}; retry the action",
+                event.base_revision
+            ));
+        }
+        if let Some(create) = self.create.as_mut() {
+            match (
+                event.action.node_id.as_str(),
+                event.action.action.as_str(),
+                event.action.kind,
+                &event.action.value,
+            ) {
+                (
+                    UI_NEW_NOTE_INPUT_ID,
+                    UI_NEW_NOTE_SET_VALUE,
+                    UiEventKind::Change,
+                    UiEventValue::Text(value),
+                ) => {
+                    create.set(value);
+                    Ok(Some(Choice::Update))
+                }
+                (
+                    UI_NEW_NOTE_INPUT_ID,
+                    UI_NEW_NOTE_SUBMIT,
+                    UiEventKind::Submit,
+                    UiEventValue::Text(value),
+                ) => {
+                    create.set(value);
+                    match create_note(&create.folder, &create.name) {
+                        Ok(path) => Ok(Some(Choice::Open(path))),
+                        Err(message) => {
+                            create.error = Some(message.clone());
+                            Err(message)
+                        }
+                    }
+                }
+                (UI_TREE_ID, UI_NEW_NOTE_CANCEL, UiEventKind::Cancel, UiEventValue::None) => {
+                    self.create = None;
+                    Ok(Some(Choice::Update))
+                }
+                _ => Ok(None),
+            }
+        } else if event.action.node_id.as_str() == UI_NEW_NOTE_ID
+            && event.action.action.as_str() == UI_NEW_NOTE_ACTION
+            && event.action.kind == UiEventKind::Activate
+            && event.action.value == UiEventValue::None
+        {
+            Ok(Some(Choice::Create(self.explorer.cwd().to_path_buf())))
+        } else {
+            self.explorer
+                .handle_ui_event(revision, UI_TREE_ID, event)
+                .map(|event| match event {
+                    Some(ExplorerEvent::FileActivated(path)) => Some(Choice::Open(path)),
+                    Some(_) => Some(Choice::Update),
+                    None => None,
+                })
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<Choice> {
@@ -269,13 +505,116 @@ impl Picker {
         if let Some(position) = self.explorer.filter_cursor_position() {
             frame.set_cursor_position(position);
         }
+        if self.create.is_some() {
+            self.draw_create_prompt(frame);
+        }
+    }
+
+    fn draw_create_prompt(&self, frame: &mut Frame) {
+        let Some(create) = &self.create else { return };
+        let width = frame.area().width.saturating_sub(4).clamp(20, 62);
+        let height = 9.min(frame.area().height);
+        let area = Rect::new(
+            frame.area().width.saturating_sub(width) / 2,
+            frame.area().height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        let block = Block::bordered()
+            .title(Span::styled(
+                " New note ",
+                Style::new().fg(self.theme.accent).bold(),
+            ))
+            .border_style(Style::new().fg(self.theme.faint));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [description, _spacer, input, target, error_row, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+        frame.render_widget(
+            Paragraph::new("Name the note you want to create.")
+                .style(Style::new().fg(self.theme.muted)),
+            description,
+        );
+        let prefix = "Name  ";
+        let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
+        let chars: Vec<char> = create.name.chars().collect();
+        let from = chars.len().saturating_sub(available);
+        let shown: String = chars[from..].iter().collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, Style::new().fg(self.theme.muted)),
+                Span::styled(shown.clone(), Style::new().fg(self.theme.strong)),
+            ])),
+            input,
+        );
+        frame.set_cursor_position(Position {
+            x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
+            y: input.y,
+        });
+        let target_name = note_stem(&create.name)
+            .map(|stem| format!("Creates {stem}.md"))
+            .unwrap_or_else(|_| "Creates a Markdown file in this folder".to_string());
+        frame.render_widget(
+            Paragraph::new(target_name).style(Style::new().fg(self.theme.faint)),
+            target,
+        );
+        if let Some(message) = create.error.as_deref() {
+            frame.render_widget(
+                Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
+                error_row,
+            );
+        }
     }
 }
 
 enum Choice {
     Open(PathBuf),
     Create(PathBuf),
+    Update,
     Quit,
+}
+
+struct CreateState {
+    folder: PathBuf,
+    name: String,
+    error: Option<String>,
+}
+
+impl CreateState {
+    fn new(folder: PathBuf) -> Self {
+        Self {
+            folder,
+            name: String::new(),
+            error: None,
+        }
+    }
+
+    fn set(&mut self, value: &str) {
+        self.name = value
+            .chars()
+            .filter(|character| !matches!(character, '\n' | '\r' | '\0'))
+            .take(120)
+            .collect();
+        self.error = None;
+    }
+
+    fn insert(&mut self, value: &str) {
+        let remaining = 120usize.saturating_sub(self.name.chars().count());
+        self.name.extend(
+            value
+                .chars()
+                .filter(|character| !matches!(character, '\n' | '\r' | '\0'))
+                .take(remaining),
+        );
+        self.error = None;
+    }
 }
 
 fn note_stem(name: &str) -> Result<String, String> {
@@ -324,117 +663,8 @@ fn create_note(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn prompt_new_note(
-    terminal: &mut DefaultTerminal,
-    root: &Path,
-    theme: Theme,
-) -> io::Result<Option<PathBuf>> {
-    let mut name = String::new();
-    let mut error: Option<String> = None;
-    loop {
-        terminal.draw(|frame| {
-            let width = frame.area().width.saturating_sub(4).clamp(20, 62);
-            let height = 9.min(frame.area().height);
-            let area = Rect::new(
-                frame.area().width.saturating_sub(width) / 2,
-                frame.area().height.saturating_sub(height) / 2,
-                width,
-                height,
-            );
-            let block = Block::bordered()
-                .title(Span::styled(
-                    " New note ",
-                    Style::new().fg(theme.accent).bold(),
-                ))
-                .border_style(Style::new().fg(theme.faint));
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            let [description, spacer, input, target, error_row, _] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .areas(inner);
-            frame.render_widget(
-                Paragraph::new("Name the note you want to create.")
-                    .style(Style::new().fg(theme.muted)),
-                description,
-            );
-            let prefix = "Name  ";
-            let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
-            let chars: Vec<char> = name.chars().collect();
-            let from = chars.len().saturating_sub(available);
-            let shown: String = chars[from..].iter().collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(theme.muted)),
-                    Span::styled(shown.clone(), Style::new().fg(theme.strong)),
-                ])),
-                input,
-            );
-            frame.set_cursor_position(Position {
-                x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
-                y: input.y,
-            });
-            let target_name = note_stem(&name)
-                .map(|stem| format!("Creates {stem}.md"))
-                .unwrap_or_else(|_| "Creates a Markdown file in this folder".to_string());
-            frame.render_widget(
-                Paragraph::new(target_name).style(Style::new().fg(theme.faint)),
-                target,
-            );
-            if let Some(message) = error.as_deref() {
-                frame.render_widget(
-                    Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
-                    error_row,
-                );
-            }
-            let _ = spacer;
-        })?;
-
-        match event::read()? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                match key.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Enter => match create_note(root, &name) {
-                        Ok(path) => return Ok(Some(path)),
-                        Err(message) => error = Some(message),
-                    },
-                    KeyCode::Backspace => {
-                        name.pop();
-                        error = None;
-                    }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        name.clear();
-                        error = None;
-                    }
-                    KeyCode::Char(character)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
-                            && name.chars().count() < 120 =>
-                    {
-                        name.push(character);
-                        error = None;
-                    }
-                    _ => {}
-                }
-            }
-            Event::Paste(text) => {
-                let pasted: String = text
-                    .chars()
-                    .filter(|character| !matches!(character, '\n' | '\r' | '\0'))
-                    .take(120usize.saturating_sub(name.chars().count()))
-                    .collect();
-                name.push_str(&pasted);
-                error = None;
-            }
-            _ => {}
-        }
-    }
+fn ui_bridge_error(error: unpeel_app_kit::UiBridgeError) -> io::Error {
+    io::Error::other(error)
 }
 
 #[cfg(test)]

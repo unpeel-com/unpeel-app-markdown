@@ -74,7 +74,7 @@ fn main() -> color_eyre::Result<()> {
             status.set_context(&browsing_context(&path));
             status.flush();
             let mut picker = Picker::open(path.clone(), theme)?;
-            while let Some(file) = picker.pick(terminal)? {
+            while let Some(file) = picker.pick(terminal, &mut ui_bridge, &mut ui_revision)? {
                 status.set_title(&display_name(&file));
                 status.set_status(&editing_status(&file));
                 status.flush();

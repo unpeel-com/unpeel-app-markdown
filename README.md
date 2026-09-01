@@ -55,9 +55,26 @@ The `/` insert picker remains a closed Markdown menu rather than a generic
 widget tree. In the TUI it is a compact, caret-anchored bordered dropdown with
 a full-width gray selection. In the native editor it stays left-aligned and
 supports Up/Down, Home/End, Return/Tab, and Escape without stealing focus from
-the document. Auto-save and the file itself remain authoritative, so renderer
-disconnects, native-view restarts, and terminal visibility changes do not lose
-the document.
+the document. `/` and the `\` command palette are opened through one optional
+App Kit `openMenu` action, and the App publishes the resulting semantic Menu;
+Swift, web, terminal, and agent participants therefore invoke the same Rust
+reducer. Right-click selection actions are the same semantic Menu vocabulary,
+mapped to the existing TUI PopupMenu, native `NSMenu`, and an ARIA web menu.
+Auto-save and the file itself remain authoritative, so renderer disconnects,
+native-view restarts, and terminal visibility changes do not lose the
+document.
+
+Vault browsing is semantic too. The existing Ratatui Explorer publishes App
+Kit's closed Tree component with opaque entry ids, filter/parent/open actions,
+selection and compact deltas; native uses SwiftUI Tree/List controls and web
+uses an ARIA tree. Creating a note transitions to an App-owned Page + Input,
+then the reducer publishes the MarkdownEditor. No picker, dialog, slash menu,
+or context menu inside an attached session is terminal-only. The remaining
+100% parity checklist is narrower: the pre-projection first-run folder
+bootstrap; semantic fields for the terminal footer's transient save/error and
+auto-save status; and native/web gestures equivalent to terminal task-marker
+clicks and trusted-local path drops. The resulting document edits already use
+the shared Markdown deltas.
 
 Status integration remains the documented plain-file plus local HTTP contract,
 implemented once by `unpeel-app-kit`'s `AppReporter`. The optional semantic UI
