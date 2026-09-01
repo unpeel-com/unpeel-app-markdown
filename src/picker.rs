@@ -10,15 +10,13 @@ use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::layout::{Position, Rect};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
     Button, ButtonRole, DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput,
-    ExplorerTheme, Input, List, Page, ThemeMonitor, UiBridge, UiBridgeEvent, UiEvent, UiEventKind,
-    UiEventOutcome, UiEventValue, UiNode, display_path_from_root, tree_delta_operations,
+    ExplorerTheme, Input, InputField, InputFieldTheme, List, ListState, Page, PageTheme,
+    ThemeMonitor, TreeState, TreeTheme, UiBridge, UiBridgeEvent, UiComponent, UiEvent, UiEventKind,
+    UiEventOutcome, UiEventValue, UiNode, tree_delta_operations,
 };
 
 use crate::theme::Theme;
@@ -40,6 +38,8 @@ pub struct Picker {
     clicks: DoubleClickTracker<PathBuf>,
     status: Option<String>,
     create: Option<CreateState>,
+    tree_state: TreeState,
+    create_input: InputField,
     theme: Theme,
     theme_monitor: ThemeMonitor,
 }
@@ -63,6 +63,9 @@ impl Picker {
             clicks: DoubleClickTracker::new(),
             status: None,
             create: None,
+            tree_state: TreeState::default(),
+            create_input: InputField::new("Note name")
+                .with_theme(InputFieldTheme::for_color_scheme(theme.kit.scheme)),
             theme,
             theme_monitor: ThemeMonitor::from_theme(theme.kit),
         })
@@ -91,7 +94,7 @@ impl Picker {
             self.publish_projection(bridge, &mut revision, &mut published)?;
             if bridge.should_render_terminal() {
                 self.drags.begin_frame();
-                terminal.draw(|frame| self.draw(frame))?;
+                terminal.draw(|frame| self.draw_node(frame, &published))?;
                 self.drags.commit()?;
             }
             while !event::poll(Duration::from_millis(250))? {
@@ -104,6 +107,8 @@ impl Picker {
                     self.theme = Theme::from_kit(self.theme_monitor.theme());
                     self.explorer
                         .set_theme(ExplorerTheme::for_theme(self.theme.kit));
+                    self.create_input
+                        .set_theme(InputFieldTheme::for_color_scheme(self.theme.kit.scheme));
                 }
             }
             match event::read()? {
@@ -164,6 +169,7 @@ impl Picker {
             Choice::Create(folder) => {
                 self.clear_drag_map()?;
                 self.create = Some(CreateState::new(folder));
+                self.create_input.set_focused(true);
                 Ok(None)
             }
             Choice::Update => Ok(None),
@@ -234,14 +240,13 @@ impl Picker {
             .back_action(UI_NEW_NOTE_CANCEL);
             return UiNode::page(UI_TREE_ID, page);
         }
-        let label = self
-            .status
-            .as_ref()
-            .map_or_else(|| "Notes".to_string(), |status| format!("Notes — {status}"));
-        let tree = self.explorer.semantic_tree(label).primary_action(
+        let mut tree = self.explorer.semantic_tree("Notes").primary_action(
             Button::new(UI_NEW_NOTE_ID, "New Markdown file", UI_NEW_NOTE_ACTION)
                 .role(ButtonRole::Primary),
         );
+        if let Some(status) = &self.status {
+            tree.location = format!("{} · {status}", tree.location);
+        }
         UiNode::tree(UI_TREE_ID, tree)
     }
 
@@ -413,13 +418,18 @@ impl Picker {
                     self.explorer
                         .filter_mouse_down(position, mouse.modifiers.contains(KeyModifiers::SHIFT));
                     self.status = None;
-                } else if let Some(path) = self
-                    .explorer
-                    .entry_at(position)
-                    .map(|entry| entry.path().to_path_buf())
+                } else if let Some((target, path)) = self
+                    .tree_state
+                    .item_id_at(position)
+                    .map(str::to_owned)
+                    .and_then(|target| {
+                        self.explorer
+                            .path_for_semantic_item(&target)
+                            .map(|path| (target, path.to_path_buf()))
+                    })
                 {
                     self.explorer.set_filter_focused(false);
-                    self.explorer.select_at(position);
+                    let _ = self.explorer.select_semantic_item(&target);
                     if self.clicks.click(path) {
                         return self.apply_explorer(ExplorerInput::Open);
                     }
@@ -460,121 +470,51 @@ impl Picker {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+    fn draw_node(&mut self, frame: &mut Frame, node: &UiNode) {
         self.create_area = Rect::default();
-        let footer_rows = u16::from(area.height >= 2);
-        let explorer_area = Rect::new(
-            area.x,
-            area.y,
-            area.width,
-            area.height.saturating_sub(footer_rows),
-        );
-        frame.render_widget(self.explorer.widget(&mut self.drags), explorer_area);
-
-        if footer_rows == 1 {
-            let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-            let action_width = footer
-                .width
-                .min("  + New Markdown file  Ctrl+N".len() as u16);
-            self.create_area = Rect::new(footer.x, footer.y, action_width, 1);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("  + ", Style::new().fg(self.theme.accent).bold()),
-                    Span::styled("New Markdown file", Style::new().fg(self.theme.strong)),
-                    Span::styled("  Ctrl+N", Style::new().fg(self.theme.muted)),
-                ])),
-                self.create_area,
-            );
-
-            let details = Rect::new(
-                footer.x.saturating_add(action_width),
-                footer.y,
-                footer.width.saturating_sub(action_width),
-                1,
-            );
-            let (message, style) = self.status.as_ref().map_or_else(
-                || {
-                    self.drags.register(details, self.explorer.cwd());
-                    (
-                        display_path_from_root(self.explorer.cwd(), &self.root),
-                        Style::new().fg(self.theme.muted),
-                    )
-                },
-                |message| (message.clone(), Style::new().fg(self.theme.kit.danger)),
-            );
-            frame.render_widget(Paragraph::new(format!("  {message}")).style(style), details);
-        }
-
-        if let Some(position) = self.explorer.filter_cursor_position() {
-            frame.set_cursor_position(position);
-        }
-        if self.create.is_some() {
-            self.draw_create_prompt(frame);
+        match &node.element {
+            UiComponent::Tree(tree) => {
+                frame.render_widget(
+                    tree.widget_with_filter(&mut self.tree_state, self.explorer.filter_input_mut())
+                        .theme(TreeTheme::for_theme(self.theme.kit)),
+                    frame.area(),
+                );
+                self.create_area = self.tree_state.primary_action_area();
+                let rows = self.tree_state.rows_area();
+                for row in 0..rows.height {
+                    let position = Position::new(rows.x, rows.y.saturating_add(row));
+                    if let Some(path) = self
+                        .tree_state
+                        .item_id_at(position)
+                        .and_then(|id| self.explorer.path_for_semantic_item(id))
+                    {
+                        self.drags
+                            .register(Rect::new(rows.x, position.y, rows.width, 1), path);
+                    }
+                }
+                if let Some(position) = self.explorer.filter_cursor_position() {
+                    frame.set_cursor_position(position);
+                }
+            }
+            UiComponent::Page(page) => {
+                let mut state = ListState::new(None);
+                frame.render_widget(
+                    page.widget(&mut self.create_input, &mut state)
+                        .theme(PageTheme::for_theme(self.theme.kit)),
+                    frame.area(),
+                );
+                if let Some(position) = self.create_input.cursor_position() {
+                    frame.set_cursor_position(position);
+                }
+            }
+            _ => {}
         }
     }
 
-    fn draw_create_prompt(&self, frame: &mut Frame) {
-        let Some(create) = &self.create else { return };
-        let width = frame.area().width.saturating_sub(4).clamp(20, 62);
-        let height = 9.min(frame.area().height);
-        let area = Rect::new(
-            frame.area().width.saturating_sub(width) / 2,
-            frame.area().height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        let block = Block::bordered()
-            .title(Span::styled(
-                " New note ",
-                Style::new().fg(self.theme.accent).bold(),
-            ))
-            .border_style(Style::new().fg(self.theme.faint));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let [description, _spacer, input, target, error_row, _] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(inner);
-        frame.render_widget(
-            Paragraph::new("Name the note you want to create.")
-                .style(Style::new().fg(self.theme.muted)),
-            description,
-        );
-        let prefix = "Name  ";
-        let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
-        let chars: Vec<char> = create.name.chars().collect();
-        let from = chars.len().saturating_sub(available);
-        let shown: String = chars[from..].iter().collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(prefix, Style::new().fg(self.theme.muted)),
-                Span::styled(shown.clone(), Style::new().fg(self.theme.strong)),
-            ])),
-            input,
-        );
-        frame.set_cursor_position(Position {
-            x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
-            y: input.y,
-        });
-        let target_name = note_stem(&create.name)
-            .map(|stem| format!("Creates {stem}.md"))
-            .unwrap_or_else(|_| "Creates a Markdown file in this folder".to_string());
-        frame.render_widget(
-            Paragraph::new(target_name).style(Style::new().fg(self.theme.faint)),
-            target,
-        );
-        if let Some(message) = create.error.as_deref() {
-            frame.render_widget(
-                Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
-                error_row,
-            );
-        }
+    #[cfg(test)]
+    fn draw(&mut self, frame: &mut Frame) {
+        let node = self.ui_node();
+        self.draw_node(frame, &node);
     }
 }
 
@@ -701,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_status_is_part_of_the_semantic_tree_label() {
+    fn picker_status_is_part_of_the_semantic_tree_location() {
         let root = tempfile::tempdir().unwrap();
         let mut picker = Picker::open(root.path().to_path_buf(), Theme::dark()).unwrap();
         picker.status = Some("could not refresh".to_string());
@@ -709,7 +649,8 @@ mod tests {
         let unpeel_app_kit::UiComponent::Tree(tree) = node.element else {
             panic!("picker must publish Tree");
         };
-        assert_eq!(tree.label, "Notes — could not refresh");
+        assert_eq!(tree.label, "Notes");
+        assert_eq!(tree.location, ". · could not refresh");
     }
 
     #[test]
@@ -818,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_picker_uses_the_borderless_app_kit_list_pattern() {
+    fn startup_picker_renders_the_exact_published_tree() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -836,26 +777,25 @@ mod tests {
                 .map(|column| buffer[(column, row)].symbol())
                 .collect::<String>()
         };
-        assert!(row_text(0).starts_with("  / Filter notes"));
-        assert!(row_text(1).starts_with("  demo.md"));
-        assert_eq!(picker.explorer.list_area(), Rect::new(0, 1, width, 4));
+        assert!(row_text(0).starts_with("  Filter: Filter notes"));
+        assert!(row_text(1).starts_with("  ."));
+        assert!(row_text(2).starts_with("  demo.md"));
+        assert_eq!(picker.tree_state.rows_area(), Rect::new(0, 2, width, 3));
         let selected_background = theme
             .kit
             .selected_row
             .bg
             .expect("App Kit selection has a background");
-        assert!((0..width).all(|column| buffer[(column, 1)].bg == selected_background));
+        assert!((0..width).all(|column| buffer[(column, 2)].bg == selected_background));
         assert_ne!(buffer[(0, 0)].symbol(), "┌");
         assert_ne!(buffer[(width - 1, 4)].symbol(), "┘");
-        let footer = row_text(5);
-        assert!(footer.contains("+ New Markdown file"));
-        assert!(footer.contains("Ctrl+N"));
-        assert!(footer.trim_end().ends_with('.'));
+        let action = row_text(5);
+        assert!(action.contains("[ New Markdown file ]"));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 1,
+            row: 2,
             modifiers: KeyModifiers::NONE,
         };
         assert!(picker.on_mouse(click).is_none(), "one click only selects");

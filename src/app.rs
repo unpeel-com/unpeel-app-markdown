@@ -7,19 +7,17 @@ use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unpeel_app_kit::{
     AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownCommandHint,
-    MarkdownEditorActions, MarkdownEditorConfig, MarkdownEditorEvent, MarkdownMenuTrigger,
-    MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu,
-    SemanticMenu, SemanticMenuAnchor, SemanticMenuItem, SemanticMenuPresentation, ThemeMonitor,
-    UiBridge, UiBridgeEvent, UiEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
-    markdown_delta_operations,
+    MarkdownEditorActions, MarkdownEditorConfig, MarkdownEditorEvent, MarkdownEditorSpec,
+    MarkdownMenuTrigger, MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem,
+    MenuTheme, PopupMenu, SemanticMenu, SemanticMenuAnchor, SemanticMenuItem,
+    SemanticMenuPresentation, ThemeMonitor, UiBridge, UiBridgeEvent, UiComponent, UiEvent,
+    UiEventKind, UiEventOutcome, UiEventValue, UiNode, markdown_delta_operations,
 };
 
 use crate::block::{self, BlockKind, EnterAction};
@@ -28,7 +26,7 @@ use crate::format::{self, Mark};
 use crate::heading;
 use crate::highlight;
 use crate::mouse;
-use crate::slash::{self, ItemId, MenuHit, MenuOrigin};
+use crate::slash::{self, ItemId, MenuOrigin};
 use crate::theme::Theme;
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
@@ -50,7 +48,7 @@ enum Mode {
 struct BlockMenu {
     origin: MenuOrigin,
     selected: usize,
-    hit: Option<MenuHit>,
+    popup: Option<PopupMenu<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,7 +189,7 @@ impl App<'_> {
             self.publish_projection(bridge, &mut revision, &mut published)?;
             if bridge.should_render_terminal() {
                 self.drop_target.begin_frame();
-                terminal.draw(|frame| self.draw(frame))?;
+                terminal.draw(|frame| self.draw_node(frame, &published))?;
                 self.drop_target.commit()?;
             }
             self.publish_context(status);
@@ -462,44 +460,10 @@ impl App<'_> {
         }));
     }
 
-    fn draw(&mut self, frame: &mut Frame) {
-        let [main, footer] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
-
-        self.draw_editor(frame, main);
-        self.draw_footer(frame, footer);
-
-        if self.mode == Mode::Menu {
-            self.draw_menu(frame, main);
-        }
-        if let Some(menu) = self.context_menu.as_mut() {
-            menu.render(frame);
-        }
-    }
-
-    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(self.footer_line()).style(Style::new().fg(self.theme.text)),
-            area,
-        );
-        let label = if self.autosave {
-            " auto-save on "
-        } else {
-            " auto-save off "
+    fn draw_node(&mut self, frame: &mut Frame, node: &UiNode) {
+        let UiComponent::MarkdownEditor(spec) = &node.element else {
+            return;
         };
-        let width = (label.len() as u16).min(area.width);
-        self.autosave_area = Rect::new(area.right().saturating_sub(width), area.y, width, 1);
-        frame.render_widget(
-            Paragraph::new(label).style(Style::new().fg(if self.autosave {
-                self.theme.accent
-            } else {
-                self.theme.muted
-            })),
-            self.autosave_area,
-        );
-    }
-
-    fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
         highlight::refresh(&mut self.textarea, self.theme);
         let show_cursor = self.context_menu.is_none()
             && (self.mode == Mode::Edit
@@ -507,21 +471,29 @@ impl App<'_> {
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.origin == MenuOrigin::Slash));
-        let config = self.editor_config();
-        self.textarea
-            .render_with_config(frame, area, show_cursor, &config);
-        self.drop_target.register(area);
+        let layout = self
+            .textarea
+            .render_component(frame, frame.area(), show_cursor, spec);
+        self.drop_target.register(layout.body);
+        self.autosave_area = Rect::default();
+
+        if self.mode == Mode::Menu {
+            self.draw_menu(frame, layout.body, spec);
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.render(frame);
+        }
     }
 
-    fn draw_menu(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(menu) = self.menu.as_ref() else {
+    #[cfg(test)]
+    fn draw(&mut self, frame: &mut Frame) {
+        let node = self.ui_node();
+        self.draw_node(frame, &node);
+    }
+
+    fn draw_menu(&mut self, frame: &mut Frame, area: Rect, spec: &MarkdownEditorSpec) {
+        let Some(semantic_menu) = spec.insert_menu.as_ref() else {
             return;
-        };
-        let items = self.visible_menu_items();
-        let selected = if items.is_empty() {
-            0
-        } else {
-            menu.selected.min(items.len() - 1)
         };
         let anchor = self
             .textarea
@@ -530,46 +502,13 @@ impl App<'_> {
                 area.x.saturating_add(2),
                 area.y.saturating_add(1),
             ));
-        let hit = slash::render_menu(
-            frame,
-            area,
-            anchor,
-            menu.origin,
-            &items,
-            selected,
-            self.theme,
-        );
+        let mut popup =
+            semantic_menu.popup(anchor, MenuTheme::for_color_scheme(self.theme.kit.scheme));
+        popup.render(frame);
         if let Some(menu) = self.menu.as_mut() {
-            menu.selected = selected;
-            menu.hit = Some(hit);
+            menu.selected = popup.selected_index().unwrap_or(0);
+            menu.popup = Some(popup);
         }
-    }
-
-    fn footer_line(&self) -> Line<'_> {
-        let (row, col) = self.textarea.cursor();
-        let mut spans: Vec<Span> = vec![
-            " ".into(),
-            Span::styled(file_name(&self.path), Style::new().fg(self.theme.strong)),
-            if self.dirty {
-                " ●  ".into()
-            } else {
-                Span::styled(" ✓  ", Style::new().fg(self.theme.faint))
-            },
-            Span::styled(
-                format!("{}:{}", row + 1, col + 1),
-                Style::new().fg(self.theme.muted),
-            ),
-            "   ".into(),
-        ];
-        let message = self
-            .status
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
-            .map(|(text, _)| text.as_str());
-        if let Some(message) = message {
-            spans.push(message.into());
-        }
-        Line::from(spans)
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
@@ -1293,7 +1232,7 @@ impl App<'_> {
         self.menu = Some(BlockMenu {
             origin,
             selected: 0,
-            hit: None,
+            popup: None,
         });
         self.drag = None;
     }
@@ -1356,14 +1295,14 @@ impl App<'_> {
     }
 
     fn menu_item_at(&self, point: Position) -> Option<usize> {
-        self.menu.as_ref()?.hit.as_ref()?.item_at(point)
+        self.menu.as_ref()?.popup.as_ref()?.item_index_at(point)
     }
 
     fn menu_contains(&self, point: Position) -> bool {
         self.menu
             .as_ref()
-            .and_then(|menu| menu.hit.as_ref())
-            .is_some_and(|hit| hit.contains(point))
+            .and_then(|menu| menu.popup.as_ref())
+            .is_some_and(|popup| popup.area().contains(point))
     }
 
     fn sync_slash_menu(&mut self) {
@@ -1745,6 +1684,7 @@ fn input_from_key(key: KeyEvent) -> Input {
 
 fn markdown_text_area_style(theme: Theme) -> MarkdownTextAreaStyle {
     MarkdownTextAreaStyle {
+        status: Style::new().fg(theme.text),
         cursor_line: Style::new().bg(theme.cursor_line),
         cursor: Style::new().bg(theme.cursor).fg(theme.cursor_text),
         selection: theme.kit.selected_row,
@@ -1785,14 +1725,14 @@ mod tests {
     }
 
     #[test]
-    fn footer_keeps_document_status_without_shortcut_help() {
+    fn terminal_status_row_is_the_published_editor_title() {
         let width = 140;
         let buffer = render_app(Theme::dark(), width, 8);
         let top = row_text(&buffer, 0);
         let footer = row_text(&buffer, 7);
 
         assert!(!top.contains("demo.md"));
-        assert!(footer.starts_with(" demo.md ✓  1:1"));
+        assert!(footer.starts_with("  demo.md · Saved · 1:1 · Auto-save on"));
         assert!(!footer.contains("CARD"));
         for shortcut in ["/ insert", "^S save", "Esc quit"] {
             assert!(

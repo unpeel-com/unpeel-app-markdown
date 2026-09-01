@@ -10,13 +10,9 @@ use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
 use unpeel_app_kit::{
-    Input, List, Page, UiBridge, UiBridgeEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
-    page_delta_operations,
+    Input, InputField, InputFieldTheme, List, ListState, Page, PageTheme, UiBridge, UiBridgeEvent,
+    UiComponent, UiEventKind, UiEventOutcome, UiEventValue, UiNode, page_delta_operations,
 };
 
 use crate::theme::Theme;
@@ -201,6 +197,9 @@ pub fn choose_workspace(
         .checked_add(1)
         .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
     let mut published = workspace_node(&value, error.as_deref(), hint);
+    let mut input = InputField::new("~/Documents/Notes")
+        .with_theme(InputFieldTheme::for_color_scheme(theme.kit.scheme));
+    input.set_focused(true);
     bridge
         .publish(UI_VIEW_ID, revision, published.clone())
         .map_err(ui_bridge_error)?;
@@ -275,77 +274,18 @@ pub fn choose_workspace(
         )?;
         if bridge.should_render_terminal() {
             terminal.draw(|frame| {
-                let width = frame.area().width.saturating_sub(4).clamp(20, 78);
-                let height = 11.min(frame.area().height);
-                let area = ratatui::layout::Rect::new(
-                    frame.area().width.saturating_sub(width) / 2,
-                    frame.area().height.saturating_sub(height) / 2,
-                    width,
-                    height,
-                );
-                let block = Block::bordered()
-                    .title(Span::styled(
-                        " UNPEEL MARKDOWN ",
-                        Style::new().fg(theme.accent).bold(),
-                    ))
-                    .border_style(Style::new().fg(theme.faint));
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                let [
-                    heading,
-                    description,
-                    spacer,
-                    input,
-                    example_row,
-                    error_row,
-                    _,
-                ] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                ])
-                .areas(inner);
+                let UiComponent::Page(page) = &published.element else {
+                    return;
+                };
+                let mut state = ListState::new(None);
                 frame.render_widget(
-                    Paragraph::new("Choose your notes folder")
-                        .style(Style::new().fg(theme.strong).bold()),
-                    heading,
+                    page.widget(&mut input, &mut state)
+                        .theme(PageTheme::for_theme(theme.kit)),
+                    frame.area(),
                 );
-                frame.render_widget(
-                    Paragraph::new("Notes will stay as ordinary Markdown files in this folder.")
-                        .style(Style::new().fg(theme.muted)),
-                    description,
-                );
-                let prefix = "Folder  ";
-                let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
-                let chars: Vec<char> = value.chars().collect();
-                let from = chars.len().saturating_sub(available);
-                let shown: String = chars[from..].iter().collect();
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(prefix, Style::new().fg(theme.muted)),
-                        Span::styled(shown.clone(), Style::new().fg(theme.strong)),
-                    ])),
-                    input,
-                );
-                frame.set_cursor_position(Position {
-                    x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
-                    y: input.y,
-                });
-                frame.render_widget(
-                    Paragraph::new(hint).style(Style::new().fg(theme.faint)),
-                    example_row,
-                );
-                if let Some(message) = error.as_deref() {
-                    frame.render_widget(
-                        Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
-                        error_row,
-                    );
+                if let Some(position) = input.cursor_position() {
+                    frame.set_cursor_position(position);
                 }
-                let _ = spacer;
             })?;
         }
 
