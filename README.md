@@ -42,9 +42,9 @@ the `unpeel-markdown` CLI directly from `PATH`: the session row takes the
 App's name and live project/workspace accent, and the sidebar shows which note
 you're editing. No App registry write is required.
 
-The same binary also exposes App Kit's optional `MarkdownEditor` projection
-when its Host injects a UI endpoint. Ratatui, SwiftUI/AppKit, and web renderers
-then edit the same authoritative document: Unicode-safe text deltas and
+The binary builds one authoritative App Kit `MarkdownEditor` tree. Ratatui is
+its standalone interpreter; when a Host injects a UI endpoint, SwiftUI/AppKit
+and web become peer interpreters of that exact structure. Unicode-safe text deltas and
 oriented selection deltas keep the caret and multi-line selection synchronized
 without replacing the full document on each keystroke. Terminal drag and
 Shift-selection, double-click word selection, and triple-click line selection
@@ -64,17 +64,14 @@ Auto-save and the file itself remain authoritative, so renderer disconnects,
 native-view restarts, and terminal visibility changes do not lose the
 document.
 
-Vault browsing is semantic too. The existing Ratatui Explorer publishes App
-Kit's closed Tree component with opaque entry ids, filter/parent/open actions,
-selection and compact deltas; native uses SwiftUI Tree/List controls and web
-uses an ARIA tree. Creating a note transitions to an App-owned Page + Input,
-then the reducer publishes the MarkdownEditor. No picker, dialog, slash menu,
-or context menu inside an attached session is terminal-only. The remaining
-100% parity checklist is narrower: the pre-projection first-run folder
-bootstrap; semantic fields for the terminal footer's transient save/error and
-auto-save status; and native/web gestures equivalent to terminal task-marker
-clicks and trusted-local path drops. The resulting document edits already use
-the shared Markdown deltas.
+Vault browsing uses the same rule. The App owns one closed Tree with opaque
+entry ids, filter/parent/open actions, selection, and compact deltas; Ratatui
+uses App Kit's Tree/Explorer interpretation, native uses SwiftUI Tree/List
+controls, and web uses an ARIA tree. Creating a note transitions to one
+App-owned Page + Input and then one MarkdownEditor. The first-run chooser,
+picker, new-note form, editor, slash menu, context menu, command hint, footer
+status, and task edits are all represented in the shared component structure;
+the Kitchen Sink screen audit reports no terminal-only Markdown surface.
 
 Status integration remains the documented plain-file plus local HTTP contract,
 implemented once by `unpeel-app-kit`'s `AppReporter`. The optional semantic UI

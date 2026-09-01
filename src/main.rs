@@ -45,7 +45,9 @@ fn main() -> color_eyre::Result<()> {
             "Unpeel Markdown",
             env!("CARGO_PKG_VERSION"),
         )
-        .description("Standalone Ratatui Markdown editor with an optional native/web projection"),
+        .description(
+            "One Markdown component tree interpreted by Ratatui, native, and web renderers",
+        ),
     )?;
     ratatui::run(|terminal| {
         let _keyboard = KeyboardEnhancementGuard::enter()?;
