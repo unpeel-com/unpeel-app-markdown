@@ -12,12 +12,12 @@ use ratatui::style::Style;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unpeel_app_kit::{
-    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownCommandHint,
-    MarkdownEditorActions, MarkdownEditorConfig, MarkdownEditorEvent, MarkdownEditorSpec,
-    MarkdownMenuTrigger, MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem,
-    MenuTheme, PopupMenu, SemanticMenu, SemanticMenuAnchor, SemanticMenuItem,
-    SemanticMenuPresentation, ThemeMonitor, UiBridge, UiBridgeEvent, UiComponent, UiEvent,
-    UiEventKind, UiEventOutcome, UiEventValue, UiNode, markdown_delta_operations,
+    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, FooterAction,
+    MarkdownCommandHint, MarkdownEditorActions, MarkdownEditorConfig, MarkdownEditorEvent,
+    MarkdownEditorSpec, MarkdownMenuTrigger, MarkdownPresentation, MarkdownTextArea,
+    MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu, SemanticMenu, SemanticMenuAnchor,
+    SemanticMenuItem, SemanticMenuPresentation, ThemeMonitor, UiBridge, UiBridgeEvent, UiComponent,
+    UiEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode, markdown_delta_operations,
 };
 
 use crate::block::{self, BlockKind, EnterAction};
@@ -38,6 +38,12 @@ const UI_CONTEXT_SEND: &str = "send-reference-to-agent";
 const UI_CONTEXT_COPY: &str = "copy-reference";
 const UI_CONTEXT_SEND_ID: &str = "context-send-agent";
 const UI_CONTEXT_COPY_ID: &str = "context-copy-reference";
+const UI_FOOTER_NEW_ID: &str = "new-note";
+const UI_FOOTER_NEW_ACTION: &str = "new-note";
+const UI_FOOTER_SAVE_ID: &str = "save-note";
+const UI_FOOTER_SAVE_ACTION: &str = "save-note";
+const UI_FOOTER_AUTOSAVE_ID: &str = "toggle-autosave";
+const UI_FOOTER_AUTOSAVE_ACTION: &str = "toggle-autosave";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -110,7 +116,7 @@ pub struct App<'a> {
     context_menu: Option<ContextMenu>,
     agent: AgentBridge,
     autosave: bool,
-    autosave_area: Rect,
+    footer_area: Rect,
     dirty: bool,
     last_edit_at: Option<Instant>,
     exit: bool,
@@ -150,7 +156,7 @@ impl App<'_> {
             context_menu: None,
             agent,
             autosave,
-            autosave_area: Rect::default(),
+            footer_area: Rect::default(),
             dirty: false,
             last_edit_at: None,
             exit: false,
@@ -214,6 +220,21 @@ impl App<'_> {
             .command_hint(MarkdownCommandHint::new("Type '/' for commands"))
             .insert_menu(self.semantic_insert_menu())
             .context_menu(self.semantic_context_menu())
+            .footer_actions([
+                FooterAction::new(UI_FOOTER_NEW_ID, "new", UI_FOOTER_NEW_ACTION)
+                    .accelerator("ctrl+n"),
+                FooterAction::new(UI_FOOTER_SAVE_ID, "save", UI_FOOTER_SAVE_ACTION)
+                    .accelerator("ctrl+s"),
+                FooterAction::new(
+                    UI_FOOTER_AUTOSAVE_ID,
+                    if self.autosave {
+                        "auto-save on"
+                    } else {
+                        "auto-save off"
+                    },
+                    UI_FOOTER_AUTOSAVE_ACTION,
+                ),
+            ])
     }
 
     fn semantic_title(&self) -> String {
@@ -294,6 +315,23 @@ impl App<'_> {
         }
         let node = event.action.node_id.as_str();
         let action = event.action.action.as_str();
+        if event.action.kind == UiEventKind::Activate && event.action.value == UiEventValue::None {
+            match (node, action) {
+                (UI_FOOTER_NEW_ID, UI_FOOTER_NEW_ACTION) => {
+                    self.new_file();
+                    return Ok(true);
+                }
+                (UI_FOOTER_SAVE_ID, UI_FOOTER_SAVE_ACTION) => {
+                    self.save();
+                    return Ok(true);
+                }
+                (UI_FOOTER_AUTOSAVE_ID, UI_FOOTER_AUTOSAVE_ACTION) => {
+                    self.toggle_autosave();
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
         if action == UI_MENU_SELECT {
             if event.action.kind != UiEventKind::Activate
                 || event.action.value != UiEventValue::None
@@ -475,7 +513,7 @@ impl App<'_> {
             .textarea
             .render_component(frame, frame.area(), show_cursor, spec);
         self.drop_target.register(layout.body);
-        self.autosave_area = Rect::default();
+        self.footer_area = layout.footer;
 
         if self.mode == Mode::Menu {
             self.draw_menu(frame, layout.body, spec);
@@ -589,6 +627,11 @@ impl App<'_> {
             self.handle_context_menu_key(key);
             return;
         }
+        let footer_action = self.ui_node().footer_action_for_key(&key).cloned();
+        if let Some(action) = footer_action {
+            self.activate_footer_action(&action);
+            return;
+        }
         if !self.handle_key_command(&key) {
             self.handle_input(input_from_key(key));
         }
@@ -601,8 +644,15 @@ impl App<'_> {
             MouseEventKind::Down(MouseButton::Left) if self.context_menu.is_some() => {
                 self.click_context_menu(point)
             }
-            MouseEventKind::Down(MouseButton::Left) if self.autosave_area.contains(point) => {
-                self.toggle_autosave()
+            MouseEventKind::Down(MouseButton::Left) if self.footer_area.contains(point) => {
+                let action = self
+                    .ui_node()
+                    .footer()
+                    .and_then(|footer| footer.action_at(point, self.footer_area))
+                    .cloned();
+                if let Some(action) = action {
+                    self.activate_footer_action(&action);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => self.on_mouse_down(point, mouse.modifiers),
             MouseEventKind::Moved if self.context_menu.is_some() => {
@@ -1013,9 +1063,7 @@ impl App<'_> {
     fn dispatch_command(&mut self, ch: char, shift: bool) -> bool {
         match ch.to_ascii_lowercase() {
             'q' | 'w' => self.exit = true,
-            'n' => self.new_file(),
             's' if shift => self.toggle_mark(Mark::Strike),
-            's' => self.save(),
             'b' => self.toggle_mark(Mark::Bold),
             'i' => self.toggle_mark(Mark::Italic),
             'e' => self.toggle_mark(Mark::Code),
@@ -1032,6 +1080,15 @@ impl App<'_> {
             _ => return false,
         }
         true
+    }
+
+    fn activate_footer_action(&mut self, action: &FooterAction) {
+        match (action.id.as_str(), action.action.as_str()) {
+            (UI_FOOTER_NEW_ID, UI_FOOTER_NEW_ACTION) => self.new_file(),
+            (UI_FOOTER_SAVE_ID, UI_FOOTER_SAVE_ACTION) => self.save(),
+            (UI_FOOTER_AUTOSAVE_ID, UI_FOOTER_AUTOSAVE_ACTION) => self.toggle_autosave(),
+            _ => self.flash("unknown footer action"),
+        }
     }
 
     fn new_file(&mut self) {
@@ -1725,21 +1782,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_status_row_is_the_published_editor_title() {
+    fn terminal_status_and_actions_are_both_published_editor_slots() {
         let width = 140;
         let buffer = render_app(Theme::dark(), width, 8);
         let top = row_text(&buffer, 0);
+        let status = row_text(&buffer, 6);
         let footer = row_text(&buffer, 7);
 
         assert!(!top.contains("demo.md"));
-        assert!(footer.starts_with("  demo.md · Saved · 1:1 · Auto-save on"));
-        assert!(!footer.contains("CARD"));
-        for shortcut in ["/ insert", "^S save", "Esc quit"] {
-            assert!(
-                !footer.contains(shortcut),
-                "unexpected {shortcut:?} in {footer:?}"
-            );
-        }
+        assert!(status.starts_with("  demo.md · Saved · 1:1 · Auto-save on"));
+        assert!(!status.contains("CARD"));
+        assert!(footer.starts_with("  ^N new  ^S save  auto-save on"));
     }
 
     #[test]

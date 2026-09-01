@@ -13,8 +13,8 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
-    Button, ButtonRole, DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput,
-    ExplorerTheme, Input, InputField, InputFieldTheme, List, ListState, Page, PageTheme,
+    DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput, ExplorerTheme,
+    FooterAction, Input, InputField, InputFieldTheme, List, ListState, Page, PageTheme,
     ThemeMonitor, TreeState, TreeTheme, UiBridge, UiBridgeEvent, UiComponent, UiEvent, UiEventKind,
     UiEventOutcome, UiEventValue, UiNode, tree_delta_operations,
 };
@@ -29,11 +29,14 @@ const UI_NEW_NOTE_INPUT_ID: &str = "new-note-name";
 const UI_NEW_NOTE_SET_VALUE: &str = "set-new-note-name";
 const UI_NEW_NOTE_SUBMIT: &str = "create-new-note";
 const UI_NEW_NOTE_CANCEL: &str = "cancel-new-note";
+const UI_PREVIOUS_ID: &str = "previous-note";
+const UI_PREVIOUS_ACTION: &str = "previous-note";
+const UI_REFRESH_ID: &str = "refresh-notes";
+const UI_REFRESH_ACTION: &str = "refresh-notes";
 
 pub struct Picker {
     root: PathBuf,
     explorer: Explorer,
-    create_area: Rect,
     drags: DragSurface,
     clicks: DoubleClickTracker<PathBuf>,
     status: Option<String>,
@@ -58,7 +61,6 @@ impl Picker {
         Ok(Self {
             root,
             explorer,
-            create_area: Rect::default(),
             drags: DragSurface::detect(),
             clicks: DoubleClickTracker::new(),
             status: None,
@@ -129,12 +131,12 @@ impl Picker {
                     }
                 }
                 Event::Mouse(mouse) if self.create.is_none() => {
-                    if let Some(choice) = self.on_mouse(mouse) {
-                        if let Some(result) = self.apply_choice(choice)? {
-                            self.publish_projection(bridge, &mut revision, &mut published)?;
-                            *revision_counter = revision;
-                            return Ok(result);
-                        }
+                    if let Some(choice) = self.on_mouse(mouse)
+                        && let Some(result) = self.apply_choice(choice)?
+                    {
+                        self.publish_projection(bridge, &mut revision, &mut published)?;
+                        *revision_counter = revision;
+                        return Ok(result);
                     }
                 }
                 Event::Paste(text) => {
@@ -240,10 +242,11 @@ impl Picker {
             .back_action(UI_NEW_NOTE_CANCEL);
             return UiNode::page(UI_TREE_ID, page);
         }
-        let mut tree = self.explorer.semantic_tree("Notes").primary_action(
-            Button::new(UI_NEW_NOTE_ID, "New Markdown file", UI_NEW_NOTE_ACTION)
-                .role(ButtonRole::Primary),
-        );
+        let mut tree = self.explorer.semantic_tree("Notes").footer_actions([
+            FooterAction::new(UI_NEW_NOTE_ID, "new", UI_NEW_NOTE_ACTION).accelerator("ctrl+n"),
+            FooterAction::new(UI_PREVIOUS_ID, "previous", UI_PREVIOUS_ACTION).accelerator("ctrl+p"),
+            FooterAction::new(UI_REFRESH_ID, "refresh", UI_REFRESH_ACTION).accelerator("ctrl+r"),
+        ]);
         if let Some(status) = &self.status {
             tree.location = format!("{} · {status}", tree.location);
         }
@@ -355,12 +358,30 @@ impl Picker {
                 }
                 _ => Ok(None),
             }
-        } else if event.action.node_id.as_str() == UI_NEW_NOTE_ID
-            && event.action.action.as_str() == UI_NEW_NOTE_ACTION
-            && event.action.kind == UiEventKind::Activate
+        } else if event.action.kind == UiEventKind::Activate
             && event.action.value == UiEventValue::None
         {
-            Ok(Some(Choice::Create(self.explorer.cwd().to_path_buf())))
+            match (event.action.node_id.as_str(), event.action.action.as_str()) {
+                (UI_NEW_NOTE_ID, UI_NEW_NOTE_ACTION) => {
+                    Ok(Some(Choice::Create(self.explorer.cwd().to_path_buf())))
+                }
+                (UI_PREVIOUS_ID, UI_PREVIOUS_ACTION) => {
+                    let choice = self.apply_explorer(ExplorerInput::Up);
+                    Ok(Some(choice.unwrap_or(Choice::Update)))
+                }
+                (UI_REFRESH_ID, UI_REFRESH_ACTION) => {
+                    let choice = self.apply_explorer(ExplorerInput::Refresh);
+                    Ok(Some(choice.unwrap_or(Choice::Update)))
+                }
+                _ => self
+                    .explorer
+                    .handle_ui_event(revision, UI_TREE_ID, event)
+                    .map(|event| match event {
+                        Some(ExplorerEvent::FileActivated(path)) => Some(Choice::Open(path)),
+                        Some(_) => Some(Choice::Update),
+                        None => None,
+                    }),
+            }
         } else {
             self.explorer
                 .handle_ui_event(revision, UI_TREE_ID, event)
@@ -378,21 +399,27 @@ impl Picker {
         if key.code == KeyCode::Char('c') && control {
             return Some(Choice::Quit);
         }
+        let footer_action = self.ui_node().footer_action_for_key(&key).cloned();
+        if let Some(action) = footer_action {
+            return match (action.id.as_str(), action.action.as_str()) {
+                (UI_NEW_NOTE_ID, UI_NEW_NOTE_ACTION) => {
+                    Some(Choice::Create(self.explorer.cwd().to_path_buf()))
+                }
+                (UI_PREVIOUS_ID, UI_PREVIOUS_ACTION) => self
+                    .apply_explorer(ExplorerInput::Up)
+                    .or(Some(Choice::Update)),
+                (UI_REFRESH_ID, UI_REFRESH_ACTION) => self
+                    .apply_explorer(ExplorerInput::Refresh)
+                    .or(Some(Choice::Update)),
+                _ => None,
+            };
+        }
         if key.code == KeyCode::Esc {
             if self.explorer.cwd() == self.root {
                 return Some(Choice::Quit);
             }
             let input = self.explorer.input_for_key(&key)?;
             return self.apply_explorer(input);
-        }
-        if key.code == KeyCode::Char('n') && control {
-            return Some(Choice::Create(self.explorer.cwd().to_path_buf()));
-        }
-        if key.code == KeyCode::Char('p') && control {
-            return self.apply_explorer(ExplorerInput::Up);
-        }
-        if key.code == KeyCode::Char('r') && control {
-            return self.apply_explorer(ExplorerInput::Refresh);
         }
         let input = self.explorer.input_for_key(&key)?;
         self.apply_explorer(input)
@@ -410,9 +437,26 @@ impl Picker {
                 self.apply_explorer(ExplorerInput::Down)
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.create_area.contains(position) {
+                let footer_action = match &self.ui_node().element {
+                    UiComponent::Tree(tree) => {
+                        self.tree_state.footer_action_at(tree, position).cloned()
+                    }
+                    _ => None,
+                };
+                if let Some(action) = footer_action {
                     self.clicks.reset();
-                    return Some(Choice::Create(self.explorer.cwd().to_path_buf()));
+                    return match (action.id.as_str(), action.action.as_str()) {
+                        (UI_NEW_NOTE_ID, UI_NEW_NOTE_ACTION) => {
+                            Some(Choice::Create(self.explorer.cwd().to_path_buf()))
+                        }
+                        (UI_PREVIOUS_ID, UI_PREVIOUS_ACTION) => self
+                            .apply_explorer(ExplorerInput::Up)
+                            .or(Some(Choice::Update)),
+                        (UI_REFRESH_ID, UI_REFRESH_ACTION) => self
+                            .apply_explorer(ExplorerInput::Refresh)
+                            .or(Some(Choice::Update)),
+                        _ => None,
+                    };
                 } else if self.explorer.filter_area().contains(position) {
                     self.clicks.reset();
                     self.explorer
@@ -471,7 +515,6 @@ impl Picker {
     }
 
     fn draw_node(&mut self, frame: &mut Frame, node: &UiNode) {
-        self.create_area = Rect::default();
         match &node.element {
             UiComponent::Tree(tree) => {
                 frame.render_widget(
@@ -479,7 +522,6 @@ impl Picker {
                         .theme(TreeTheme::for_theme(self.theme.kit)),
                     frame.area(),
                 );
-                self.create_area = self.tree_state.primary_action_area();
                 let rows = self.tree_state.rows_area();
                 for row in 0..rows.height {
                     let position = Position::new(rows.x, rows.y.saturating_add(row));
@@ -790,7 +832,9 @@ mod tests {
         assert_ne!(buffer[(0, 0)].symbol(), "┌");
         assert_ne!(buffer[(width - 1, 4)].symbol(), "┘");
         let action = row_text(5);
-        assert!(action.contains("[ New Markdown file ]"));
+        assert!(action.contains("^N new"));
+        assert!(action.contains("^P previous"));
+        assert!(action.contains("^R refresh"));
 
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -806,8 +850,8 @@ mod tests {
 
         let create_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: picker.create_area.x + 2,
-            row: picker.create_area.y,
+            column: picker.tree_state.footer_area().x + 2,
+            row: picker.tree_state.footer_area().y,
             modifiers: KeyModifiers::NONE,
         };
         assert!(matches!(
