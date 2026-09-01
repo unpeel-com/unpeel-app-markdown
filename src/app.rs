@@ -638,6 +638,13 @@ impl App<'_> {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.textarea.track_mouse(&mouse);
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.track_mouse(&mouse);
+        }
+        if let Some(popup) = self.menu.as_mut().and_then(|menu| menu.popup.as_mut()) {
+            popup.track_mouse(&mouse);
+        }
         let point = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(point),

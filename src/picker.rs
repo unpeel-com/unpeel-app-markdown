@@ -426,6 +426,7 @@ impl Picker {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Choice> {
+        self.tree_state.track_mouse(&mouse);
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
