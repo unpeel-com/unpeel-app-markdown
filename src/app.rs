@@ -14,11 +14,11 @@ use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, Input, Key};
 use unpeel_app_kit::{
-    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownEditorActions,
-    MarkdownEditorConfig, MarkdownEditorEvent, MarkdownMenuTrigger, MarkdownPresentation,
-    MarkdownTextArea, MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu, SemanticMenu,
-    SemanticMenuAnchor, SemanticMenuItem, SemanticMenuPresentation, ThemeMonitor, UiBridge,
-    UiBridgeEvent, UiComponent, UiEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
+    AgentBridge, AppReporter, DropTargetEvent, DropTargetSurface, MarkdownCommandHint,
+    MarkdownEditorActions, MarkdownEditorConfig, MarkdownEditorEvent, MarkdownMenuTrigger,
+    MarkdownPresentation, MarkdownTextArea, MarkdownTextAreaStyle, MenuItem, MenuTheme, PopupMenu,
+    SemanticMenu, SemanticMenuAnchor, SemanticMenuItem, SemanticMenuPresentation, ThemeMonitor,
+    UiBridge, UiBridgeEvent, UiEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
     markdown_delta_operations,
 };
 
@@ -135,6 +135,7 @@ impl App<'_> {
             String::new()
         };
         let mut textarea = MarkdownTextArea::new(contents.lines(), markdown_text_area_style(theme));
+        textarea.text_area_mut().set_placeholder_text("");
         highlight::refresh(&mut textarea, theme);
         let agent = AgentBridge::new();
         agent.refresh();
@@ -212,6 +213,9 @@ impl App<'_> {
             .dirty(self.dirty)
             .presentation(self.presentation)
             .open_menu_action(MarkdownEditorActions::OPEN_MENU)
+            .command_hint(MarkdownCommandHint::new("Type '/' for commands"))
+            .insert_menu(self.semantic_insert_menu())
+            .context_menu(self.semantic_context_menu())
     }
 
     fn semantic_title(&self) -> String {
@@ -244,13 +248,7 @@ impl App<'_> {
     }
 
     fn ui_node(&self) -> UiNode {
-        let mut node = self.textarea.ui_node(&self.editor_config());
-        let UiComponent::MarkdownEditor(editor) = &mut node.element else {
-            unreachable!("MarkdownTextArea always projects MarkdownEditor")
-        };
-        editor.insert_menu = self.semantic_insert_menu();
-        editor.context_menu = Some(self.semantic_context_menu());
-        node
+        self.textarea.ui_node(&self.editor_config())
     }
 
     fn semantic_insert_menu(&self) -> Option<SemanticMenu> {
@@ -409,21 +407,7 @@ impl App<'_> {
                             UiEventOutcome::Applied
                         }
                         Some(Ok(Some(MarkdownEditorEvent::MenuRequested(trigger)))) => {
-                            if !self.can_open_slash() {
-                                UiEventOutcome::Rejected(
-                                    "Block menus open only on a blank line outside code fences"
-                                        .to_string(),
-                                )
-                            } else {
-                                if trigger == MarkdownMenuTrigger::Slash {
-                                    self.textarea.insert_char('/');
-                                    self.after_edit();
-                                    self.open_menu(MenuOrigin::Slash);
-                                } else {
-                                    self.open_menu(MenuOrigin::Palette);
-                                }
-                                UiEventOutcome::Applied
-                            }
+                            self.handle_semantic_menu_trigger(trigger)
                         }
                         Some(Ok(Some(MarkdownEditorEvent::SaveRequested))) => {
                             self.save();
@@ -483,7 +467,6 @@ impl App<'_> {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
 
         self.draw_editor(frame, main);
-        self.draw_empty_hint(frame, main);
         self.draw_footer(frame, footer);
 
         if self.mode == Mode::Menu {
@@ -524,7 +507,9 @@ impl App<'_> {
                     .menu
                     .as_ref()
                     .is_some_and(|menu| menu.origin == MenuOrigin::Slash));
-        self.textarea.render(frame, area, show_cursor);
+        let config = self.editor_config();
+        self.textarea
+            .render_with_config(frame, area, show_cursor, &config);
         self.drop_target.register(area);
     }
 
@@ -1275,6 +1260,29 @@ impl App<'_> {
         )
     }
 
+    /// Applies a renderer's declared text trigger against authoritative Rust
+    /// state. Renderers never decide blank-line/fence eligibility themselves.
+    fn handle_semantic_menu_trigger(&mut self, trigger: MarkdownMenuTrigger) -> UiEventOutcome {
+        if self.can_open_slash() {
+            if trigger == MarkdownMenuTrigger::Slash {
+                self.textarea.insert_char('/');
+                self.after_edit();
+                self.open_menu(MenuOrigin::Slash);
+            } else {
+                self.open_menu(MenuOrigin::Palette);
+            }
+            return UiEventOutcome::Applied;
+        }
+
+        self.textarea.insert_char(match trigger {
+            MarkdownMenuTrigger::Slash => '/',
+            MarkdownMenuTrigger::Palette => '\\',
+        });
+        self.after_edit();
+        self.apply_markdown_shortcut();
+        UiEventOutcome::Applied
+    }
+
     fn in_fence(&self) -> bool {
         slash::in_code_fence(self.textarea.lines(), self.textarea.cursor().0)
     }
@@ -1556,35 +1564,6 @@ impl App<'_> {
         true
     }
 
-    fn draw_empty_hint(&self, frame: &mut Frame, area: Rect) {
-        if self.mode != Mode::Edit || self.menu.is_some() {
-            return;
-        }
-        let (row, _) = self.textarea.cursor();
-        let Some(line) = self.textarea.lines().get(row) else {
-            return;
-        };
-        if !line.is_empty() || slash::in_code_fence(self.textarea.lines(), row) {
-            return;
-        }
-        let lines = self.textarea.lines();
-        if lines.len() == 1 && lines[0].is_empty() {
-            return;
-        }
-        let Some(position) = self.textarea.rendered_cursor_position() else {
-            return;
-        };
-        let hint = "Type '/' for commands";
-        let width = (hint.chars().count() as u16).min(area.right().saturating_sub(position.x));
-        if width < 4 {
-            return;
-        }
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::new().fg(self.theme.faint)),
-            Rect::new(position.x, position.y, width, 1),
-        );
-    }
-
     fn after_edit(&mut self) {
         self.dirty = true;
         self.last_edit_at = Some(Instant::now());
@@ -1786,6 +1765,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unpeel_app_kit::UiComponent;
 
     fn render_app(theme: Theme, width: u16, height: u16) -> ratatui::buffer::Buffer {
         use ratatui::Terminal;
@@ -1834,6 +1814,73 @@ mod tests {
         let title = editor.title.unwrap();
         assert!(title.contains("demo.md · Saved · 1:1 · Auto-save off"));
         assert!(title.contains("saved manually"));
+    }
+
+    #[test]
+    fn command_hint_is_one_spec_value_in_terminal_and_semantic_renderers() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("commands.md");
+        std::fs::write(&path, "# Commands\n\nBody\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.textarea.move_cursor(CursorMove::Jump(1, 0));
+
+        let node = app.ui_node();
+        assert!(
+            node.required_capabilities()
+                .contains(&"markdownCommandHint")
+        );
+        let UiComponent::MarkdownEditor(editor) = node.element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        assert_eq!(
+            editor.command_hint.as_ref().map(|hint| hint.text.as_str()),
+            Some("Type '/' for commands")
+        );
+        assert!(editor.command_hint_visible());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(row_text(terminal.backend().buffer(), 1).contains("Type '/' for commands"));
+    }
+
+    #[test]
+    fn rust_reducer_alone_decides_whether_slash_opens_the_semantic_menu() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("commands.md");
+        std::fs::write(&path, "body\n").unwrap();
+        let mut app = App::open(path, Theme::dark()).unwrap();
+        app.textarea.move_cursor(CursorMove::End);
+
+        assert!(matches!(
+            app.handle_semantic_menu_trigger(MarkdownMenuTrigger::Slash),
+            UiEventOutcome::Applied
+        ));
+        assert_eq!(app.textarea.lines(), ["body/"]);
+        assert!(
+            app.menu.is_none(),
+            "an ineligible slash remains ordinary text"
+        );
+
+        let blank_path = temp.path().join("blank.md");
+        std::fs::write(&blank_path, "").unwrap();
+        let mut blank = App::open(blank_path, Theme::dark()).unwrap();
+        assert!(matches!(
+            blank.handle_semantic_menu_trigger(MarkdownMenuTrigger::Slash),
+            UiEventOutcome::Applied
+        ));
+        assert_eq!(blank.textarea.lines(), ["/"]);
+        assert_eq!(
+            blank.menu.as_ref().map(|menu| menu.origin),
+            Some(MenuOrigin::Slash)
+        );
+        let UiComponent::MarkdownEditor(editor) = blank.ui_node().element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        assert!(editor.insert_menu.is_some());
+        assert!(!editor.command_hint_visible());
     }
 
     #[test]
