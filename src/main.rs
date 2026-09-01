@@ -55,8 +55,13 @@ fn main() -> color_eyre::Result<()> {
             None => match start::read_workspace(install::APP_ID) {
                 Some(path) => path,
                 None => {
-                    let Some(path) =
-                        start::choose_workspace(terminal, theme, app_context.current_root())?
+                    let Some(path) = start::choose_workspace(
+                        terminal,
+                        theme,
+                        app_context.current_root(),
+                        &mut ui_bridge,
+                        &mut ui_revision,
+                    )?
                     else {
                         return Ok(());
                     };

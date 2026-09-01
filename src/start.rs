@@ -6,6 +6,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -13,10 +14,20 @@ use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
+use unpeel_app_kit::{
+    Input, List, Page, UiBridge, UiBridgeEvent, UiEventKind, UiEventOutcome, UiEventValue, UiNode,
+    page_delta_operations,
+};
 
 use crate::theme::Theme;
 
 const STATE_VERSION: u64 = 1;
+const UI_VIEW_ID: &str = "main";
+const UI_ROOT_ID: &str = "workspace-page";
+const UI_INPUT_ID: &str = "workspace-folder";
+const UI_SET_VALUE: &str = "set-workspace-folder";
+const UI_SUBMIT: &str = "choose-workspace-folder";
+const UI_CANCEL: &str = "cancel-workspace-folder";
 
 fn config_root() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("UNPEEL_APP_CONFIG_HOME") {
@@ -180,91 +191,179 @@ pub fn choose_workspace(
     terminal: &mut DefaultTerminal,
     theme: Theme,
     project_root: Option<&Path>,
+    bridge: &mut UiBridge,
+    revision_counter: &mut u64,
 ) -> io::Result<Option<PathBuf>> {
     let mut value = default_folder_input(project_root);
     let mut error: Option<String> = None;
     let hint = "Press Enter to use this folder, or edit the path";
+    let mut revision = revision_counter
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+    let mut published = workspace_node(&value, error.as_deref(), hint);
+    bridge
+        .publish(UI_VIEW_ID, revision, published.clone())
+        .map_err(ui_bridge_error)?;
     loop {
-        terminal.draw(|frame| {
-            let width = frame.area().width.saturating_sub(4).clamp(20, 78);
-            let height = 11.min(frame.area().height);
-            let area = ratatui::layout::Rect::new(
-                frame.area().width.saturating_sub(width) / 2,
-                frame.area().height.saturating_sub(height) / 2,
-                width,
-                height,
-            );
-            let block = Block::bordered()
-                .title(Span::styled(
-                    " UNPEEL MARKDOWN ",
-                    Style::new().fg(theme.accent).bold(),
+        while let Some(message) = bridge.poll().map_err(ui_bridge_error)? {
+            let UiBridgeEvent::Action { event, .. } = message else {
+                continue;
+            };
+            let mut result = None;
+            let outcome = if event.base_revision != revision {
+                UiEventOutcome::Rejected(format!(
+                    "Folder chooser changed from revision {} to {revision}; retry the action",
+                    event.base_revision
                 ))
-                .border_style(Style::new().fg(theme.faint));
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            let [
-                heading,
-                description,
-                spacer,
-                input,
-                example_row,
-                error_row,
-                _,
-            ] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Fill(1),
-            ])
-            .areas(inner);
-            frame.render_widget(
-                Paragraph::new("Choose your notes folder")
-                    .style(Style::new().fg(theme.strong).bold()),
-                heading,
-            );
-            frame.render_widget(
-                Paragraph::new("Notes will stay as ordinary Markdown files in this folder.")
-                    .style(Style::new().fg(theme.muted)),
-                description,
-            );
-            let prefix = "Folder  ";
-            let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
-            let chars: Vec<char> = value.chars().collect();
-            let from = chars.len().saturating_sub(available);
-            let shown: String = chars[from..].iter().collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(prefix, Style::new().fg(theme.muted)),
-                    Span::styled(shown.clone(), Style::new().fg(theme.strong)),
-                ])),
-                input,
-            );
-            frame.set_cursor_position(Position {
-                x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
-                y: input.y,
-            });
-            frame.render_widget(
-                Paragraph::new(hint).style(Style::new().fg(theme.faint)),
-                example_row,
-            );
-            if let Some(message) = error.as_deref() {
-                frame.render_widget(
-                    Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
-                    error_row,
-                );
+            } else {
+                match (
+                    event.action.node_id.as_str(),
+                    event.action.action.as_str(),
+                    event.action.kind,
+                    &event.action.value,
+                ) {
+                    (UI_INPUT_ID, UI_SET_VALUE, UiEventKind::Change, UiEventValue::Text(next)) => {
+                        value = sanitized_folder_input(next);
+                        error = None;
+                        UiEventOutcome::Applied
+                    }
+                    (UI_INPUT_ID, UI_SUBMIT, UiEventKind::Submit, UiEventValue::Text(next)) => {
+                        value = sanitized_folder_input(next);
+                        match resolve_folder_input(&value) {
+                            Ok(path) => {
+                                result = Some(Some(path));
+                                UiEventOutcome::Applied
+                            }
+                            Err(failure) => {
+                                error = Some(failure.to_string());
+                                UiEventOutcome::Rejected(failure.to_string())
+                            }
+                        }
+                    }
+                    (UI_ROOT_ID, UI_CANCEL, UiEventKind::Cancel, UiEventValue::None) => {
+                        result = Some(None);
+                        UiEventOutcome::Applied
+                    }
+                    _ => UiEventOutcome::Rejected(
+                        "Action targets a different folder chooser component".to_string(),
+                    ),
+                }
+            };
+            publish_workspace_projection(
+                bridge,
+                &mut revision,
+                &mut published,
+                &value,
+                error.as_deref(),
+                hint,
+            )?;
+            bridge
+                .acknowledge(&event, outcome, revision)
+                .map_err(ui_bridge_error)?;
+            if let Some(result) = result {
+                *revision_counter = revision;
+                return Ok(result);
             }
-            let _ = spacer;
-        })?;
+        }
+        publish_workspace_projection(
+            bridge,
+            &mut revision,
+            &mut published,
+            &value,
+            error.as_deref(),
+            hint,
+        )?;
+        if bridge.should_render_terminal() {
+            terminal.draw(|frame| {
+                let width = frame.area().width.saturating_sub(4).clamp(20, 78);
+                let height = 11.min(frame.area().height);
+                let area = ratatui::layout::Rect::new(
+                    frame.area().width.saturating_sub(width) / 2,
+                    frame.area().height.saturating_sub(height) / 2,
+                    width,
+                    height,
+                );
+                let block = Block::bordered()
+                    .title(Span::styled(
+                        " UNPEEL MARKDOWN ",
+                        Style::new().fg(theme.accent).bold(),
+                    ))
+                    .border_style(Style::new().fg(theme.faint));
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let [
+                    heading,
+                    description,
+                    spacer,
+                    input,
+                    example_row,
+                    error_row,
+                    _,
+                ] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .areas(inner);
+                frame.render_widget(
+                    Paragraph::new("Choose your notes folder")
+                        .style(Style::new().fg(theme.strong).bold()),
+                    heading,
+                );
+                frame.render_widget(
+                    Paragraph::new("Notes will stay as ordinary Markdown files in this folder.")
+                        .style(Style::new().fg(theme.muted)),
+                    description,
+                );
+                let prefix = "Folder  ";
+                let available = input.width.saturating_sub(prefix.len() as u16).max(1) as usize;
+                let chars: Vec<char> = value.chars().collect();
+                let from = chars.len().saturating_sub(available);
+                let shown: String = chars[from..].iter().collect();
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(prefix, Style::new().fg(theme.muted)),
+                        Span::styled(shown.clone(), Style::new().fg(theme.strong)),
+                    ])),
+                    input,
+                );
+                frame.set_cursor_position(Position {
+                    x: input.x + prefix.len() as u16 + shown.chars().count() as u16,
+                    y: input.y,
+                });
+                frame.render_widget(
+                    Paragraph::new(hint).style(Style::new().fg(theme.faint)),
+                    example_row,
+                );
+                if let Some(message) = error.as_deref() {
+                    frame.render_widget(
+                        Paragraph::new(message).style(Style::new().fg(ratatui::style::Color::Red)),
+                        error_row,
+                    );
+                }
+                let _ = spacer;
+            })?;
+        }
 
+        if !event::poll(Duration::from_millis(120))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match key.code {
-                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Esc => {
+                        *revision_counter = revision;
+                        return Ok(None);
+                    }
                     KeyCode::Enter => match resolve_folder_input(&value) {
-                        Ok(path) => return Ok(Some(path)),
+                        Ok(path) => {
+                            *revision_counter = revision;
+                            return Ok(Some(path));
+                        }
                         Err(failure) => error = Some(failure.to_string()),
                     },
                     KeyCode::Backspace => {
@@ -299,6 +398,65 @@ pub fn choose_workspace(
             _ => {}
         }
     }
+}
+
+fn workspace_node(value: &str, error: Option<&str>, hint: &str) -> UiNode {
+    let message = error.unwrap_or(hint);
+    UiNode::page(
+        UI_ROOT_ID,
+        Page::new(
+            "Choose your notes folder",
+            List::new("workspace-details", Vec::new()).empty_message(message),
+        )
+        .input(
+            Input::new(UI_INPUT_ID, "Folder")
+                .value(value)
+                .placeholder("~/Documents/Notes")
+                .set_value_action(UI_SET_VALUE)
+                .submit_action(UI_SUBMIT),
+        )
+        .back_action(UI_CANCEL),
+    )
+}
+
+fn publish_workspace_projection(
+    bridge: &mut UiBridge,
+    revision: &mut u64,
+    published: &mut UiNode,
+    value: &str,
+    error: Option<&str>,
+    hint: &str,
+) -> io::Result<()> {
+    let next = workspace_node(value, error, hint);
+    if next == *published {
+        return Ok(());
+    }
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("Markdown UI revision space is exhausted"))?;
+    bridge
+        .publish_delta(
+            UI_VIEW_ID,
+            *revision,
+            next_revision,
+            page_delta_operations(published, &next),
+        )
+        .map_err(ui_bridge_error)?;
+    *revision = next_revision;
+    *published = next;
+    Ok(())
+}
+
+fn sanitized_folder_input(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '\n' | '\r' | '\0'))
+        .take(512)
+        .collect()
+}
+
+fn ui_bridge_error(error: unpeel_app_kit::UiBridgeError) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 #[cfg(test)]
@@ -371,5 +529,21 @@ mod tests {
             default_folder_input(Some(Path::new("/opt/current-worktree"))),
             "/opt/current-worktree/docs"
         );
+    }
+
+    #[test]
+    fn first_run_folder_chooser_is_a_semantic_page_with_native_input_actions() {
+        let node = workspace_node("~/Notes", Some("enter a folder path"), "hint");
+        let unpeel_app_kit::UiComponent::Page(page) = node.element else {
+            panic!("first-run chooser must publish Page");
+        };
+        page.validate().unwrap();
+        assert_eq!(page.back.as_deref(), Some(UI_CANCEL));
+        let input = page.input_spec().unwrap();
+        assert_eq!(input.id, UI_INPUT_ID);
+        assert_eq!(input.value, "~/Notes");
+        assert_eq!(input.set_value.as_deref(), Some(UI_SET_VALUE));
+        assert_eq!(input.submit.as_deref(), Some(UI_SUBMIT));
+        assert_eq!(page.list().empty_message, "enter a folder path");
     }
 }

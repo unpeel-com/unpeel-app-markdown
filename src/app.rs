@@ -208,10 +208,39 @@ impl App<'_> {
 
     fn editor_config(&self) -> MarkdownEditorConfig {
         MarkdownEditorConfig::new(UI_EDITOR_ID)
-            .title(file_name(&self.path))
+            .title(self.semantic_title())
             .dirty(self.dirty)
             .presentation(self.presentation)
             .open_menu_action(MarkdownEditorActions::OPEN_MENU)
+    }
+
+    fn semantic_title(&self) -> String {
+        let (row, col) = self.textarea.cursor();
+        let save_state = if self.dirty { "Unsaved" } else { "Saved" };
+        let autosave = if self.autosave {
+            "Auto-save on"
+        } else {
+            "Auto-save off"
+        };
+        let message = self
+            .status
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+            .map(|(text, _)| text.as_str());
+        match message {
+            Some(message) => format!(
+                "{} · {save_state} · {}:{} · {autosave} · {message}",
+                file_name(&self.path),
+                row + 1,
+                col + 1
+            ),
+            None => format!(
+                "{} · {save_state} · {}:{} · {autosave}",
+                file_name(&self.path),
+                row + 1,
+                col + 1
+            ),
+        }
     }
 
     fn ui_node(&self) -> UiNode {
@@ -1791,6 +1820,20 @@ mod tests {
                 "unexpected {shortcut:?} in {footer:?}"
             );
         }
+    }
+
+    #[test]
+    fn semantic_editor_title_carries_the_terminal_footer_state() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.md");
+        let mut app = App::open_with_autosave(path, Theme::dark(), false).unwrap();
+        app.flash("saved manually");
+        let node = app.ui_node();
+        let UiComponent::MarkdownEditor(editor) = node.element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        let title = editor.title.unwrap();
+        assert!(title.contains("demo.md · Saved · 1:1 · Auto-save off"));
+        assert!(title.contains("saved manually"));
     }
 
     #[test]

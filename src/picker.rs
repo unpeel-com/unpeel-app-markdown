@@ -234,7 +234,11 @@ impl Picker {
             .back_action(UI_NEW_NOTE_CANCEL);
             return UiNode::page(UI_TREE_ID, page);
         }
-        let tree = self.explorer.semantic_tree("Notes").primary_action(
+        let label = self
+            .status
+            .as_ref()
+            .map_or_else(|| "Notes".to_string(), |status| format!("Notes — {status}"));
+        let tree = self.explorer.semantic_tree(label).primary_action(
             Button::new(UI_NEW_NOTE_ID, "New Markdown file", UI_NEW_NOTE_ACTION)
                 .role(ButtonRole::Primary),
         );
@@ -694,6 +698,18 @@ mod tests {
             picker.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Some(Choice::Create(folder)) if folder == picker.root
         ));
+    }
+
+    #[test]
+    fn picker_status_is_part_of_the_semantic_tree_label() {
+        let root = tempfile::tempdir().unwrap();
+        let mut picker = Picker::open(root.path().to_path_buf(), Theme::dark()).unwrap();
+        picker.status = Some("could not refresh".to_string());
+        let node = picker.ui_node();
+        let unpeel_app_kit::UiComponent::Tree(tree) = node.element else {
+            panic!("picker must publish Tree");
+        };
+        assert_eq!(tree.label, "Notes — could not refresh");
     }
 
     #[test]
