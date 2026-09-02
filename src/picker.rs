@@ -13,10 +13,10 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::{DefaultTerminal, Frame};
 use unpeel_app_kit::{
-    DoubleClickTracker, DragSurface, Explorer, ExplorerEvent, ExplorerInput, ExplorerTheme,
-    FooterAction, Input, InputField, InputFieldTheme, List, ListState, Page, PageTheme,
-    ThemeMonitor, TreeState, TreeTheme, UiBridge, UiBridgeEvent, UiComponent, UiEvent, UiEventKind,
-    UiEventOutcome, UiEventValue, UiNode, tree_delta_operations,
+    DoubleClickTracker, DragSurface, Explorer, ExplorerEntryDetail, ExplorerEvent, ExplorerInput,
+    ExplorerTheme, FooterAction, Input, InputField, InputFieldTheme, List, ListState, Page,
+    PageTheme, ThemeMonitor, TreeState, TreeTheme, UiBridge, UiBridgeEvent, UiComponent, UiEvent,
+    UiEventKind, UiEventOutcome, UiEventValue, UiNode, tree_delta_operations,
 };
 
 use crate::theme::Theme;
@@ -51,6 +51,7 @@ impl Picker {
     pub fn open(root: PathBuf, theme: Theme) -> io::Result<Self> {
         let mut explorer = Explorer::scoped(root)?
             .with_file_extensions(["md"])?
+            .with_entry_detail(ExplorerEntryDetail::new(first_heading))?
             .with_theme(ExplorerTheme::for_theme(theme.kit));
         explorer.set_show_path(false);
         explorer.set_filter_placeholder("Filter notes");
@@ -604,6 +605,22 @@ impl CreateState {
     }
 }
 
+/// The first `#` heading in a note, read from a bounded prefix so large
+/// vaults stay cheap to list. Shown muted beside the file name.
+fn first_heading(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = vec![0u8; 8 * 1024];
+    let read = file.read(&mut prefix).ok()?;
+    prefix.truncate(read);
+    let text = String::from_utf8_lossy(&prefix);
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("# "))
+        .map(|heading| heading.trim().to_owned())
+        .filter(|heading| !heading.is_empty())
+}
+
 fn note_stem(name: &str) -> Result<String, String> {
     let name = name.trim().trim_end_matches(".md").trim();
     if name.is_empty() {
@@ -693,7 +710,13 @@ mod tests {
             panic!("picker must publish Tree");
         };
         assert_eq!(tree.label, "Notes");
-        assert_eq!(tree.location, ". · could not refresh");
+        let root_name = picker
+            .root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(tree.location, format!("{root_name} · could not refresh"));
     }
 
     #[test]
@@ -710,6 +733,35 @@ mod tests {
             picker.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Some(Choice::Create(folder)) if folder == nested
         ));
+    }
+
+    #[test]
+    fn notes_show_their_first_heading_as_muted_detail() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("demo.md"),
+            "---\ntitle: x\n---\n\n# Demo heading\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("plain.md"), "no heading here\n").unwrap();
+        let mut picker = Picker::open(root.path().to_path_buf(), Theme::dark()).unwrap();
+        let details = picker
+            .explorer
+            .entries()
+            .iter()
+            .map(|entry| (entry.display_name(), entry.detail().map(str::to_owned)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            details,
+            [
+                ("demo.md".to_owned(), Some("Demo heading".to_owned())),
+                ("plain.md".to_owned(), None),
+            ]
+        );
+        let UiComponent::Tree(tree) = picker.ui_node().element else {
+            panic!("picker publishes a Tree");
+        };
+        assert_eq!(tree.items[0].detail.as_deref(), Some("Demo heading"));
     }
 
     #[test]
@@ -822,14 +874,15 @@ mod tests {
         };
         assert!(row_text(0).starts_with("  Filter: Filter notes"));
         assert!(row_text(1).starts_with("  ."));
-        assert!(row_text(2).starts_with("  demo.md"));
-        assert_eq!(picker.tree_state.rows_area(), Rect::new(0, 2, width, 3));
+        assert!(row_text(2).trim().is_empty(), "padding row under the title");
+        assert!(row_text(3).starts_with("  demo.md"));
+        assert_eq!(picker.tree_state.rows_area(), Rect::new(0, 3, width, 2));
         let selected_background = theme
             .kit
             .selected_row
             .bg
             .expect("App Kit selection has a background");
-        assert!((0..width).all(|column| buffer[(column, 2)].bg == selected_background));
+        assert!((0..width).all(|column| buffer[(column, 3)].bg == selected_background));
         assert_ne!(buffer[(0, 0)].symbol(), "┌");
         assert_ne!(buffer[(width - 1, 4)].symbol(), "┘");
         let action = row_text(5);
@@ -840,7 +893,7 @@ mod tests {
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 5,
-            row: 2,
+            row: 3,
             modifiers: KeyModifiers::NONE,
         };
         assert!(picker.on_mouse(click).is_none(), "one click only selects");

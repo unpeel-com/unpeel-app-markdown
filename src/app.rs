@@ -44,6 +44,7 @@ const UI_FOOTER_SAVE_ID: &str = "save-note";
 const UI_FOOTER_SAVE_ACTION: &str = "save-note";
 const UI_FOOTER_AUTOSAVE_ID: &str = "toggle-autosave";
 const UI_FOOTER_AUTOSAVE_ACTION: &str = "toggle-autosave";
+const UI_BACK_ACTION: &str = "back-to-notes";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -116,6 +117,9 @@ pub struct App<'a> {
     context_menu: Option<ContextMenu>,
     agent: AgentBridge,
     autosave: bool,
+    /// Opened from the note list: the title carries a back chevron.
+    back_to_list: bool,
+    status_area: Rect,
     footer_area: Rect,
     dirty: bool,
     last_edit_at: Option<Instant>,
@@ -130,6 +134,13 @@ impl App<'_> {
     #[cfg(test)]
     pub fn open(path: PathBuf, theme: Theme) -> io::Result<Self> {
         Self::open_with_autosave(path, theme, true)
+    }
+
+    /// Shows a back chevron in the title that returns to the note list.
+    #[must_use]
+    pub fn with_back_to_list(mut self, enabled: bool) -> Self {
+        self.back_to_list = enabled;
+        self
     }
 
     pub fn open_with_autosave(path: PathBuf, theme: Theme, autosave: bool) -> io::Result<Self> {
@@ -156,6 +167,8 @@ impl App<'_> {
             context_menu: None,
             agent,
             autosave,
+            back_to_list: false,
+            status_area: Rect::default(),
             footer_area: Rect::default(),
             dirty: false,
             last_edit_at: None,
@@ -212,7 +225,11 @@ impl App<'_> {
     }
 
     fn editor_config(&self) -> MarkdownEditorConfig {
-        MarkdownEditorConfig::new(UI_EDITOR_ID)
+        let mut config = MarkdownEditorConfig::new(UI_EDITOR_ID);
+        if self.back_to_list {
+            config = config.back_action(UI_BACK_ACTION);
+        }
+        config
             .title(self.semantic_title())
             .dirty(self.dirty)
             .presentation(self.presentation)
@@ -240,11 +257,6 @@ impl App<'_> {
     fn semantic_title(&self) -> String {
         let (row, col) = self.textarea.cursor();
         let save_state = if self.dirty { "Unsaved" } else { "Saved" };
-        let autosave = if self.autosave {
-            "Auto-save on"
-        } else {
-            "Auto-save off"
-        };
         let message = self
             .status
             .as_ref()
@@ -252,13 +264,13 @@ impl App<'_> {
             .map(|(text, _)| text.as_str());
         match message {
             Some(message) => format!(
-                "{} · {save_state} · {}:{} · {autosave} · {message}",
+                "{} · {save_state} · {}:{} · {message}",
                 file_name(&self.path),
                 row + 1,
                 col + 1
             ),
             None => format!(
-                "{} · {save_state} · {}:{} · {autosave}",
+                "{} · {save_state} · {}:{}",
                 file_name(&self.path),
                 row + 1,
                 col + 1
@@ -449,6 +461,10 @@ impl App<'_> {
                             self.save();
                             UiEventOutcome::Applied
                         }
+                        Some(Ok(Some(MarkdownEditorEvent::BackRequested))) => {
+                            self.exit = true;
+                            UiEventOutcome::Applied
+                        }
                         Some(Ok(Some(MarkdownEditorEvent::SelectionChanged)))
                         | Some(Ok(Some(MarkdownEditorEvent::TextChanged { changed: false })))
                         | Some(Ok(Some(MarkdownEditorEvent::Undo { changed: false })))
@@ -514,6 +530,7 @@ impl App<'_> {
             .render_component(frame, frame.area(), show_cursor, spec);
         self.drop_target.register(layout.body);
         self.footer_area = layout.footer;
+        self.status_area = layout.status;
 
         if self.mode == Mode::Menu {
             self.draw_menu(frame, layout.body, spec);
@@ -650,6 +667,11 @@ impl App<'_> {
             MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(point),
             MouseEventKind::Down(MouseButton::Left) if self.context_menu.is_some() => {
                 self.click_context_menu(point)
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.back_to_list && self.status_area.contains(point) =>
+            {
+                self.exit = true;
             }
             MouseEventKind::Down(MouseButton::Left) if self.footer_area.contains(point) => {
                 let action = self
@@ -1752,6 +1774,7 @@ fn markdown_text_area_style(theme: Theme) -> MarkdownTextAreaStyle {
         cursor_line: Style::new().bg(theme.cursor_line),
         cursor: Style::new().bg(theme.cursor).fg(theme.cursor_text),
         selection: theme.kit.selected_row,
+        hovered: theme.kit.hovered_row,
         gutter: Style::new().fg(theme.faint),
         current_gutter: Style::new().fg(theme.muted),
         scrollbar_track: theme.kit.scrollbar_track,
@@ -1792,13 +1815,18 @@ mod tests {
     fn terminal_status_and_actions_are_both_published_editor_slots() {
         let width = 140;
         let buffer = render_app(Theme::dark(), width, 8);
-        let top = row_text(&buffer, 0);
-        let status = row_text(&buffer, 6);
+        let status = row_text(&buffer, 0);
+        let padding = row_text(&buffer, 1);
+        let body = row_text(&buffer, 2);
         let footer = row_text(&buffer, 7);
 
-        assert!(!top.contains("demo.md"));
-        assert!(status.starts_with("  demo.md · Saved · 1:1 · Auto-save on"));
-        assert!(!status.contains("CARD"));
+        assert!(
+            status.starts_with("  demo.md · Saved · 1:1"),
+            "title sits on top: {status}"
+        );
+        assert!(!status.contains("Auto-save"), "the footer owns auto-save");
+        assert!(padding.trim().is_empty(), "one empty row under the title");
+        assert!(!body.contains("demo.md"));
         assert!(footer.starts_with("  ^N new  ^S save  auto-save on"));
     }
 
@@ -1812,8 +1840,22 @@ mod tests {
             panic!("Markdown App must publish MarkdownEditor");
         };
         let title = editor.title.unwrap();
-        assert!(title.contains("demo.md · Saved · 1:1 · Auto-save off"));
+        assert!(title.contains("demo.md · Saved · 1:1"));
+        assert!(!title.contains("Auto-save"));
         assert!(title.contains("saved manually"));
+        assert!(
+            editor.back.is_none(),
+            "single-file mode has no list to go back to"
+        );
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo.md");
+        let app = App::open_with_autosave(path, Theme::dark(), false)
+            .unwrap()
+            .with_back_to_list(true);
+        let UiComponent::MarkdownEditor(editor) = app.ui_node().element else {
+            panic!("Markdown App must publish MarkdownEditor");
+        };
+        assert_eq!(editor.back.as_deref(), Some(UI_BACK_ACTION));
     }
 
     #[test]
@@ -1843,7 +1885,8 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        assert!(row_text(terminal.backend().buffer(), 1).contains("Type '/' for commands"));
+        // Rows 0 and 1 are the title and its padding; the body starts at 2.
+        assert!(row_text(terminal.backend().buffer(), 3).contains("Type '/' for commands"));
     }
 
     #[test]
@@ -1924,8 +1967,9 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
             terminal.draw(|frame| app.draw(frame)).unwrap();
             let buffer = terminal.backend().buffer();
+            // Rows 0 and 1 are the title and its padding; the document starts at 2.
             let start = (0..buffer.area.width)
-                .find(|column| buffer[(*column, 0)].symbol() == "#")
+                .find(|column| buffer[(*column, 2)].symbol() == "#")
                 .expect("selected line is visible");
             let selected_background = theme
                 .kit
@@ -1939,12 +1983,12 @@ mod tests {
                 .expect("App Kit selection has a foreground");
             for column in start..start + text.len() as u16 {
                 assert_eq!(
-                    buffer[(column, 0)].bg,
+                    buffer[(column, 2)].bg,
                     selected_background,
                     "selection background at column {column}"
                 );
                 assert_eq!(
-                    buffer[(column, 0)].fg,
+                    buffer[(column, 2)].fg,
                     selected_foreground,
                     "selection foreground at column {column}"
                 );
