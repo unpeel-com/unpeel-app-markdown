@@ -90,6 +90,25 @@ curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
 The checksum-verified installer places the CLI on `PATH`; Unpeel discovers it
 without running the App or mutating `~/.unpeel`.
 
+With Unpeel 0.6+, install the official build on the active workspace Host and
+open a document through its typed resource dispatcher:
+
+```sh
+unpeel apps install unpeel.app.markdown
+unpeel open README.md
+```
+
+The install command asks for confirmation in a terminal. Noninteractive
+user-owned automation must pass `--yes` explicitly.
+
+The same commands target the selected scoped/remote Host, so the binary and
+file stay together on that workspace. A Controller can offer the same install
+then-open flow when Markdown is missing. Agents can discover and suggest this
+App through Unpeel MCP, but that MCP surface never installs or creates a
+Session: those remain explicit user actions. Like all same-user terminal
+policy, this is cooperative rather than an OS sandbox around arbitrary CLI
+commands.
+
 ## Release
 
 The public `unpeel` server repository owns the shared App publisher and the
