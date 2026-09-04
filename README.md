@@ -90,30 +90,24 @@ curl -fsSL https://unpeel.com/install/markdown/install.sh | sh
 The checksum-verified installer places the CLI on `PATH`; Unpeel discovers it
 without running the App or mutating `~/.unpeel`.
 
-To build and install from source, keep App Kit beside the App repository:
+## Release
+
+The public `unpeel` server repository owns the shared App publisher and the
+official registry entry. From clean sibling checkouts on a Mac:
 
 ```sh
-mkdir -p ~/Dev && cd ~/Dev
-git clone https://github.com/unpeel-com/unpeel-app-kit.git
-git clone https://github.com/unpeel-com/unpeel-app-markdown.git
-cargo install --locked --path unpeel-app-markdown
+cd ../unpeel
+cargo test --manifest-path ../unpeel-app-markdown/Cargo.toml
+bun run release:app -- --app markdown --channel beta --dry-run
+bun run release:app -- --app markdown --channel beta
 ```
 
-## Development
+The publisher builds an ad-hoc-signed macOS universal binary and accepts
+Linux x86_64/aarch64 archives through its documented `--linux-*` flags. It
+uploads immutable versioned archives plus the mutable `-latest` archive and
+mandatory SHA-256 sidecar under `<channel>/markdown/`. Each tarball contains
+one root member named `unpeel-markdown`, which is the exact contract used by
+both the standalone installer and `unpeel apps install`.
 
-```sh
-cargo run -- demo.md   # the editor on the bundled demo document
-cargo run -- .         # vault mode on the current directory
-cargo test
-```
-
-The editor follows the terminal's light or dark palette at startup. Set
-`UNPEEL_TUI_THEME=light` or `UNPEEL_TUI_THEME=dark` to override the shared
-App Kit theme detection.
-
-Drag a file or folder anywhere over the editor body to preview its exact
-insertion caret. Hovering near the top or bottom edge auto-scrolls, and the
-drop inserts at that caret. This uses App Kit's reusable semantic drop-target
-surface; outside Unpeel, ordinary terminal paste behavior remains available.
-
-Ported from the `markdown-editor` experiment in `unpeel-experiments`.
+Publishing is intentionally separate from source tagging. Test the beta
+installer and Host install before promoting the same version to stable.
