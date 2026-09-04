@@ -107,7 +107,7 @@ Linux x86_64/aarch64 archives through its documented `--linux-*` flags. It
 uploads immutable versioned archives plus the mutable `-latest` archive and
 mandatory SHA-256 sidecar under `<channel>/markdown/`. Each tarball contains
 one root member named `unpeel-markdown`, which is the exact contract used by
-both the standalone installer and `unpeel apps install`.
+the standalone installer (and, from Unpeel 0.6, the Host-side App installer).
 
 Publishing is intentionally separate from source tagging. Test the beta
 installer and Host install before promoting the same version to stable.
